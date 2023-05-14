@@ -551,8 +551,8 @@ diff -ruN st.orig/st.c st/st.c
  #define ISDELIM(u)		(u && wcschr(worddelimiters, u))
 +#define TLINE(y)		((y) < term.scr ? term.hist[((y) + term.histi - \
 +				term.scr + HISTSIZE + 1) % HISTSIZE] : \
-+
- 
++				term.line[(y) - term.scr])
++ 
  enum term_mode {
  	MODE_WRAP        = 1 << 0,
 @@ -115,6 +122,9 @@
@@ -741,7 +741,7 @@ diff -ruN st.orig/st.c st/st.c
  
  void
 -tscrollup(int orig, int n)
-++tscrollup(int orig, int n, int copyhist)
++tscrollup(int orig, int n, int copyhist)
  {
  	int i;
  	Line temp;
@@ -1268,7 +1268,7 @@ diff -ruN st.orig/x.c st/x.c
 -		xclear(winx, 0, winx + width, borderpx);
 -	if (winy + win.ch >= borderpx + win.th)
 +		xclear(winx, 0, winx + width, win.vborderpx);
-++	if (winy + win.ch >= win.vborderpx + win.th)
++	if (winy + win.ch >= win.vborderpx + win.th)
  		xclear(winx, winy + win.ch, winx + width, win.h);
  
  	/* Clean up the region we want to draw to. */
@@ -1724,6 +1724,7 @@ diff -ruN st.orig/x.c st/x.c
  	win.cursor = cursor;
 +	cursorblinks = win.cursor == 0 || win.cursor == 1 ||
 +	               win.cursor == 3 || win.cursor == 5 ||
++ 				   win.cursor == 7;
 +
  	return 0;
  }
