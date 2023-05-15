@@ -1,59 +1,457 @@
-diff -ruN st.orig/Makefile st/Makefile
---- st.orig/Makefile	2023-05-14 14:31:17.035380023 +0200
-+++ st/Makefile	2023-05-14 14:22:03.501766174 +0200
-@@ -44,6 +44,8 @@
- 	mkdir -p $(DESTDIR)$(PREFIX)/bin
- 	cp -f st $(DESTDIR)$(PREFIX)/bin
- 	chmod 755 $(DESTDIR)$(PREFIX)/bin/st
-+	cp -f st-autocomplete $(DESTDIR)$(PREFIX)/bin
-+	chmod 755 $(DESTDIR)$(PREFIX)/bin/st-autocomplete
- 	mkdir -p $(DESTDIR)$(MANPREFIX)/man1
- 	sed "s/VERSION/$(VERSION)/g" < st.1 > $(DESTDIR)$(MANPREFIX)/man1/st.1
- 	chmod 644 $(DESTDIR)$(MANPREFIX)/man1/st.1
-@@ -52,6 +54,7 @@
+diff -ruN st.org/Makefile st.patched/Makefile
+--- st.org/Makefile	2023-05-15 12:40:32.125952000 +0200
++++ st.patched/Makefile	2023-05-15 13:54:00.202836000 +0200
+@@ -4,7 +4,7 @@
  
- uninstall:
- 	rm -f $(DESTDIR)$(PREFIX)/bin/st
-+	rm -f $(DESTDIR)$(PREFIX)/bin/st-autocomplete
- 	rm -f $(DESTDIR)$(MANPREFIX)/man1/st.1
+ include config.mk
  
- .PHONY: all options clean dist install uninstall
-diff -ruN st.orig/autocomplete.h st/autocomplete.h
---- st.orig/autocomplete.h	1970-01-01 01:00:00.000000000 +0100
-+++ st/autocomplete.h	2023-05-14 14:16:59.551146138 +0200
-@@ -0,0 +1,16 @@
-+# ifndef __ST_AUTOCOMPLETE_H
-+# define __ST_AUTOCOMPLETE_H
+-SRC = st.c x.c
++SRC = st.c x.c boxdraw.c hb.c
+ OBJ = $(SRC:.c=.o)
+ 
+ all: options st
+@@ -22,7 +22,9 @@
+ 	$(CC) $(STCFLAGS) -c $<
+ 
+ st.o: config.h st.h win.h
+-x.o: arg.h config.h st.h win.h
++x.o: arg.h config.h st.h win.h hb.h
++boxdraw.o: config.h st.h boxdraw_data.h
++hb.o: st.h
+ 
+ $(OBJ): config.h config.mk
+ 
+diff -ruN st.org/boxdraw.c st.patched/boxdraw.c
+--- st.org/boxdraw.c	1970-01-01 01:00:00.000000000 +0100
++++ st.patched/boxdraw.c	2023-05-15 13:51:38.798174000 +0200
+@@ -0,0 +1,194 @@
++/*
++ * Copyright 2018 Avi Halachmi (:avih) avihpit@yahoo.com https://github.com/avih
++ * MIT/X Consortium License
++ */
 +
-+enum {
-+	ACMPL_DEACTIVATE,
-+	ACMPL_WORD,
-+	ACMPL_WWORD,
-+	ACMPL_FUZZY_WORD,
-+	ACMPL_FUZZY_WWORD,
-+	ACMPL_FUZZY,
-+	ACMPL_SUFFIX,
-+	ACMPL_SURROUND,
-+	ACMPL_UNDO,
++#include <X11/Xft/Xft.h>
++#include "st.h"
++#include "boxdraw_data.h"
++
++/* Rounded non-negative integers division of n / d  */
++#define DIV(n, d) (((n) + (d) / 2) / (d))
++
++static Display *xdpy;
++static Colormap xcmap;
++static XftDraw *xd;
++static Visual *xvis;
++
++static void drawbox(int, int, int, int, XftColor *, XftColor *, ushort);
++static void drawboxlines(int, int, int, int, XftColor *, ushort);
++
++/* public API */
++
++void
++boxdraw_xinit(Display *dpy, Colormap cmap, XftDraw *draw, Visual *vis)
++{
++	xdpy = dpy; xcmap = cmap; xd = draw, xvis = vis;
++}
++
++int
++isboxdraw(Rune u)
++{
++	Rune block = u & ~0xff;
++	return (boxdraw && block == 0x2500 && boxdata[(uint8_t)u]) ||
++	       (boxdraw_braille && block == 0x2800);
++}
++
++/* the "index" is actually the entire shape data encoded as ushort */
++ushort
++boxdrawindex(const Glyph *g)
++{
++	if (boxdraw_braille && (g->u & ~0xff) == 0x2800)
++		return BRL | (uint8_t)g->u;
++	if (boxdraw_bold && (g->mode & ATTR_BOLD))
++		return BDB | boxdata[(uint8_t)g->u];
++	return boxdata[(uint8_t)g->u];
++}
++
++void
++drawboxes(int x, int y, int cw, int ch, XftColor *fg, XftColor *bg,
++          const XftGlyphFontSpec *specs, int len)
++{
++	for ( ; len-- > 0; x += cw, specs++)
++		drawbox(x, y, cw, ch, fg, bg, (ushort)specs->glyph);
++}
++
++/* implementation */
++
++void
++drawbox(int x, int y, int w, int h, XftColor *fg, XftColor *bg, ushort bd)
++{
++	ushort cat = bd & ~(BDB | 0xff);  /* mask out bold and data */
++	if (bd & (BDL | BDA)) {
++		/* lines (light/double/heavy/arcs) */
++		drawboxlines(x, y, w, h, fg, bd);
++
++	} else if (cat == BBD) {
++		/* lower (8-X)/8 block */
++		int d = DIV((uint8_t)bd * h, 8);
++		XftDrawRect(xd, fg, x, y + d, w, h - d);
++
++	} else if (cat == BBU) {
++		/* upper X/8 block */
++		XftDrawRect(xd, fg, x, y, w, DIV((uint8_t)bd * h, 8));
++
++	} else if (cat == BBL) {
++		/* left X/8 block */
++		XftDrawRect(xd, fg, x, y, DIV((uint8_t)bd * w, 8), h);
++
++	} else if (cat == BBR) {
++		/* right (8-X)/8 block */
++		int d = DIV((uint8_t)bd * w, 8);
++		XftDrawRect(xd, fg, x + d, y, w - d, h);
++
++	} else if (cat == BBQ) {
++		/* Quadrants */
++		int w2 = DIV(w, 2), h2 = DIV(h, 2);
++		if (bd & TL)
++			XftDrawRect(xd, fg, x, y, w2, h2);
++		if (bd & TR)
++			XftDrawRect(xd, fg, x + w2, y, w - w2, h2);
++		if (bd & BL)
++			XftDrawRect(xd, fg, x, y + h2, w2, h - h2);
++		if (bd & BR)
++			XftDrawRect(xd, fg, x + w2, y + h2, w - w2, h - h2);
++
++	} else if (bd & BBS) {
++		/* Shades - data is 1/2/3 for 25%/50%/75% alpha, respectively */
++		int d = (uint8_t)bd;
++		XftColor xfc;
++		XRenderColor xrc = { .alpha = 0xffff };
++
++		xrc.red = DIV(fg->color.red * d + bg->color.red * (4 - d), 4);
++		xrc.green = DIV(fg->color.green * d + bg->color.green * (4 - d), 4);
++		xrc.blue = DIV(fg->color.blue * d + bg->color.blue * (4 - d), 4);
++
++		XftColorAllocValue(xdpy, xvis, xcmap, &xrc, &xfc);
++		XftDrawRect(xd, &xfc, x, y, w, h);
++		XftColorFree(xdpy, xvis, xcmap, &xfc);
++
++	} else if (cat == BRL) {
++		/* braille, each data bit corresponds to one dot at 2x4 grid */
++		int w1 = DIV(w, 2);
++		int h1 = DIV(h, 4), h2 = DIV(h, 2), h3 = DIV(3 * h, 4);
++
++		if (bd & 1)   XftDrawRect(xd, fg, x, y, w1, h1);
++		if (bd & 2)   XftDrawRect(xd, fg, x, y + h1, w1, h2 - h1);
++		if (bd & 4)   XftDrawRect(xd, fg, x, y + h2, w1, h3 - h2);
++		if (bd & 8)   XftDrawRect(xd, fg, x + w1, y, w - w1, h1);
++		if (bd & 16)  XftDrawRect(xd, fg, x + w1, y + h1, w - w1, h2 - h1);
++		if (bd & 32)  XftDrawRect(xd, fg, x + w1, y + h2, w - w1, h3 - h2);
++		if (bd & 64)  XftDrawRect(xd, fg, x, y + h3, w1, h - h3);
++		if (bd & 128) XftDrawRect(xd, fg, x + w1, y + h3, w - w1, h - h3);
++
++	}
++}
++
++void
++drawboxlines(int x, int y, int w, int h, XftColor *fg, ushort bd)
++{
++	/* s: stem thickness. width/8 roughly matches underscore thickness. */
++	/* We draw bold as 1.5 * normal-stem and at least 1px thicker.      */
++	/* doubles draw at least 3px, even when w or h < 3. bold needs 6px. */
++	int mwh = MIN(w, h);
++	int base_s = MAX(1, DIV(mwh, 8));
++	int bold = (bd & BDB) && mwh >= 6;  /* possibly ignore boldness */
++	int s = bold ? MAX(base_s + 1, DIV(3 * base_s, 2)) : base_s;
++	int w2 = DIV(w - s, 2), h2 = DIV(h - s, 2);
++	/* the s-by-s square (x + w2, y + h2, s, s) is the center texel.    */
++	/* The base length (per direction till edge) includes this square.  */
++
++	int light = bd & (LL | LU | LR | LD);
++	int double_ = bd & (DL | DU | DR | DD);
++
++	if (light) {
++		/* d: additional (negative) length to not-draw the center   */
++		/* texel - at arcs and avoid drawing inside (some) doubles  */
++		int arc = bd & BDA;
++		int multi_light = light & (light - 1);
++		int multi_double = double_ & (double_ - 1);
++		/* light crosses double only at DH+LV, DV+LH (ref. shapes)  */
++		int d = arc || (multi_double && !multi_light) ? -s : 0;
++
++		if (bd & LL)
++			XftDrawRect(xd, fg, x, y + h2, w2 + s + d, s);
++		if (bd & LU)
++			XftDrawRect(xd, fg, x + w2, y, s, h2 + s + d);
++		if (bd & LR)
++			XftDrawRect(xd, fg, x + w2 - d, y + h2, w - w2 + d, s);
++		if (bd & LD)
++			XftDrawRect(xd, fg, x + w2, y + h2 - d, s, h - h2 + d);
++	}
++
++	/* double lines - also align with light to form heavy when combined */
++	if (double_) {
++		/*
++		* going clockwise, for each double-ray: p is additional length
++		* to the single-ray nearer to the previous direction, and n to
++		* the next. p and n adjust from the base length to lengths
++		* which consider other doubles - shorter to avoid intersections
++		* (p, n), or longer to draw the far-corner texel (n).
++		*/
++		int dl = bd & DL, du = bd & DU, dr = bd & DR, dd = bd & DD;
++		if (dl) {
++			int p = dd ? -s : 0, n = du ? -s : dd ? s : 0;
++			XftDrawRect(xd, fg, x, y + h2 + s, w2 + s + p, s);
++			XftDrawRect(xd, fg, x, y + h2 - s, w2 + s + n, s);
++		}
++		if (du) {
++			int p = dl ? -s : 0, n = dr ? -s : dl ? s : 0;
++			XftDrawRect(xd, fg, x + w2 - s, y, s, h2 + s + p);
++			XftDrawRect(xd, fg, x + w2 + s, y, s, h2 + s + n);
++		}
++		if (dr) {
++			int p = du ? -s : 0, n = dd ? -s : du ? s : 0;
++			XftDrawRect(xd, fg, x + w2 - p, y + h2 - s, w - w2 + p, s);
++			XftDrawRect(xd, fg, x + w2 - n, y + h2 + s, w - w2 + n, s);
++		}
++		if (dd) {
++			int p = dr ? -s : 0, n = dl ? -s : dr ? s : 0;
++			XftDrawRect(xd, fg, x + w2 + s, y + h2 - p, s, h - h2 + p);
++			XftDrawRect(xd, fg, x + w2 - s, y + h2 - n, s, h - h2 + n);
++		}
++	}
++}
+diff -ruN st.org/boxdraw_data.h st.patched/boxdraw_data.h
+--- st.org/boxdraw_data.h	1970-01-01 01:00:00.000000000 +0100
++++ st.patched/boxdraw_data.h	2023-05-15 13:51:38.798435000 +0200
+@@ -0,0 +1,214 @@
++/*
++ * Copyright 2018 Avi Halachmi (:avih) avihpit@yahoo.com https://github.com/avih
++ * MIT/X Consortium License
++ */
++
++/*
++ * U+25XX codepoints data
++ *
++ * References:
++ *   http://www.unicode.org/charts/PDF/U2500.pdf
++ *   http://www.unicode.org/charts/PDF/U2580.pdf
++ *
++ * Test page:
++ *   https://github.com/GNOME/vte/blob/master/doc/boxes.txt
++ */
++
++/* Each shape is encoded as 16-bits. Higher bits are category, lower are data */
++/* Categories (mutually exclusive except BDB): */
++/* For convenience, BDL/BDA/BBS/BDB are 1 bit each, the rest are enums */
++#define BDL (1<<8)   /* Box Draw Lines (light/double/heavy) */
++#define BDA (1<<9)   /* Box Draw Arc (light) */
++
++#define BBD (1<<10)  /* Box Block Down (lower) X/8 */
++#define BBL (2<<10)  /* Box Block Left X/8 */
++#define BBU (3<<10)  /* Box Block Upper X/8 */
++#define BBR (4<<10)  /* Box Block Right X/8 */
++#define BBQ (5<<10)  /* Box Block Quadrants */
++#define BRL (6<<10)  /* Box Braille (data is lower byte of U28XX) */
++
++#define BBS (1<<14)  /* Box Block Shades */
++#define BDB (1<<15)  /* Box Draw is Bold */
++
++/* (BDL/BDA) Light/Double/Heavy x Left/Up/Right/Down/Horizontal/Vertical      */
++/* Heavy is light+double (literally drawing light+double align to form heavy) */
++#define LL (1<<0)
++#define LU (1<<1)
++#define LR (1<<2)
++#define LD (1<<3)
++#define LH (LL+LR)
++#define LV (LU+LD)
++
++#define DL (1<<4)
++#define DU (1<<5)
++#define DR (1<<6)
++#define DD (1<<7)
++#define DH (DL+DR)
++#define DV (DU+DD)
++
++#define HL (LL+DL)
++#define HU (LU+DU)
++#define HR (LR+DR)
++#define HD (LD+DD)
++#define HH (HL+HR)
++#define HV (HU+HD)
++
++/* (BBQ) Quadrants Top/Bottom x Left/Right */
++#define TL (1<<0)
++#define TR (1<<1)
++#define BL (1<<2)
++#define BR (1<<3)
++
++/* Data for U+2500 - U+259F except dashes/diagonals */
++static const unsigned short boxdata[256] = {
++	/* light lines */
++	[0x00] = BDL + LH,       /* light horizontal */
++	[0x02] = BDL + LV,       /* light vertical */
++	[0x0c] = BDL + LD + LR,  /* light down and right */
++	[0x10] = BDL + LD + LL,  /* light down and left */
++	[0x14] = BDL + LU + LR,  /* light up and right */
++	[0x18] = BDL + LU + LL,  /* light up and left */
++	[0x1c] = BDL + LV + LR,  /* light vertical and right */
++	[0x24] = BDL + LV + LL,  /* light vertical and left */
++	[0x2c] = BDL + LH + LD,  /* light horizontal and down */
++	[0x34] = BDL + LH + LU,  /* light horizontal and up */
++	[0x3c] = BDL + LV + LH,  /* light vertical and horizontal */
++	[0x74] = BDL + LL,       /* light left */
++	[0x75] = BDL + LU,       /* light up */
++	[0x76] = BDL + LR,       /* light right */
++	[0x77] = BDL + LD,       /* light down */
++
++	/* heavy [+light] lines */
++	[0x01] = BDL + HH,
++	[0x03] = BDL + HV,
++	[0x0d] = BDL + HR + LD,
++	[0x0e] = BDL + HD + LR,
++	[0x0f] = BDL + HD + HR,
++	[0x11] = BDL + HL + LD,
++	[0x12] = BDL + HD + LL,
++	[0x13] = BDL + HD + HL,
++	[0x15] = BDL + HR + LU,
++	[0x16] = BDL + HU + LR,
++	[0x17] = BDL + HU + HR,
++	[0x19] = BDL + HL + LU,
++	[0x1a] = BDL + HU + LL,
++	[0x1b] = BDL + HU + HL,
++	[0x1d] = BDL + HR + LV,
++	[0x1e] = BDL + HU + LD + LR,
++	[0x1f] = BDL + HD + LR + LU,
++	[0x20] = BDL + HV + LR,
++	[0x21] = BDL + HU + HR + LD,
++	[0x22] = BDL + HD + HR + LU,
++	[0x23] = BDL + HV + HR,
++	[0x25] = BDL + HL + LV,
++	[0x26] = BDL + HU + LD + LL,
++	[0x27] = BDL + HD + LU + LL,
++	[0x28] = BDL + HV + LL,
++	[0x29] = BDL + HU + HL + LD,
++	[0x2a] = BDL + HD + HL + LU,
++	[0x2b] = BDL + HV + HL,
++	[0x2d] = BDL + HL + LD + LR,
++	[0x2e] = BDL + HR + LL + LD,
++	[0x2f] = BDL + HH + LD,
++	[0x30] = BDL + HD + LH,
++	[0x31] = BDL + HD + HL + LR,
++	[0x32] = BDL + HR + HD + LL,
++	[0x33] = BDL + HH + HD,
++	[0x35] = BDL + HL + LU + LR,
++	[0x36] = BDL + HR + LU + LL,
++	[0x37] = BDL + HH + LU,
++	[0x38] = BDL + HU + LH,
++	[0x39] = BDL + HU + HL + LR,
++	[0x3a] = BDL + HU + HR + LL,
++	[0x3b] = BDL + HH + HU,
++	[0x3d] = BDL + HL + LV + LR,
++	[0x3e] = BDL + HR + LV + LL,
++	[0x3f] = BDL + HH + LV,
++	[0x40] = BDL + HU + LH + LD,
++	[0x41] = BDL + HD + LH + LU,
++	[0x42] = BDL + HV + LH,
++	[0x43] = BDL + HU + HL + LD + LR,
++	[0x44] = BDL + HU + HR + LD + LL,
++	[0x45] = BDL + HD + HL + LU + LR,
++	[0x46] = BDL + HD + HR + LU + LL,
++	[0x47] = BDL + HH + HU + LD,
++	[0x48] = BDL + HH + HD + LU,
++	[0x49] = BDL + HV + HL + LR,
++	[0x4a] = BDL + HV + HR + LL,
++	[0x4b] = BDL + HV + HH,
++	[0x78] = BDL + HL,
++	[0x79] = BDL + HU,
++	[0x7a] = BDL + HR,
++	[0x7b] = BDL + HD,
++	[0x7c] = BDL + HR + LL,
++	[0x7d] = BDL + HD + LU,
++	[0x7e] = BDL + HL + LR,
++	[0x7f] = BDL + HU + LD,
++
++	/* double [+light] lines */
++	[0x50] = BDL + DH,
++	[0x51] = BDL + DV,
++	[0x52] = BDL + DR + LD,
++	[0x53] = BDL + DD + LR,
++	[0x54] = BDL + DR + DD,
++	[0x55] = BDL + DL + LD,
++	[0x56] = BDL + DD + LL,
++	[0x57] = BDL + DL + DD,
++	[0x58] = BDL + DR + LU,
++	[0x59] = BDL + DU + LR,
++	[0x5a] = BDL + DU + DR,
++	[0x5b] = BDL + DL + LU,
++	[0x5c] = BDL + DU + LL,
++	[0x5d] = BDL + DL + DU,
++	[0x5e] = BDL + DR + LV,
++	[0x5f] = BDL + DV + LR,
++	[0x60] = BDL + DV + DR,
++	[0x61] = BDL + DL + LV,
++	[0x62] = BDL + DV + LL,
++	[0x63] = BDL + DV + DL,
++	[0x64] = BDL + DH + LD,
++	[0x65] = BDL + DD + LH,
++	[0x66] = BDL + DD + DH,
++	[0x67] = BDL + DH + LU,
++	[0x68] = BDL + DU + LH,
++	[0x69] = BDL + DH + DU,
++	[0x6a] = BDL + DH + LV,
++	[0x6b] = BDL + DV + LH,
++	[0x6c] = BDL + DH + DV,
++
++	/* (light) arcs */
++	[0x6d] = BDA + LD + LR,
++	[0x6e] = BDA + LD + LL,
++	[0x6f] = BDA + LU + LL,
++	[0x70] = BDA + LU + LR,
++
++	/* Lower (Down) X/8 block (data is 8 - X) */
++	[0x81] = BBD + 7, [0x82] = BBD + 6, [0x83] = BBD + 5, [0x84] = BBD + 4,
++	[0x85] = BBD + 3, [0x86] = BBD + 2, [0x87] = BBD + 1, [0x88] = BBD + 0,
++
++	/* Left X/8 block (data is X) */
++	[0x89] = BBL + 7, [0x8a] = BBL + 6, [0x8b] = BBL + 5, [0x8c] = BBL + 4,
++	[0x8d] = BBL + 3, [0x8e] = BBL + 2, [0x8f] = BBL + 1,
++
++	/* upper 1/2 (4/8), 1/8 block (X), right 1/2, 1/8 block (8-X) */
++	[0x80] = BBU + 4, [0x94] = BBU + 1,
++	[0x90] = BBR + 4, [0x95] = BBR + 7,
++
++	/* Quadrants */
++	[0x96] = BBQ + BL,
++	[0x97] = BBQ + BR,
++	[0x98] = BBQ + TL,
++	[0x99] = BBQ + TL + BL + BR,
++	[0x9a] = BBQ + TL + BR,
++	[0x9b] = BBQ + TL + TR + BL,
++	[0x9c] = BBQ + TL + TR + BR,
++	[0x9d] = BBQ + TR,
++	[0x9e] = BBQ + BL + TR,
++	[0x9f] = BBQ + BL + TR + BR,
++
++	/* Shades, data is an alpha value in 25% units (1/4, 1/2, 3/4) */
++	[0x91] = BBS + 1, [0x92] = BBS + 2, [0x93] = BBS + 3,
++
++	/* U+2504 - U+250B, U+254C - U+254F: unsupported (dashes) */
++	/* U+2571 - U+2573: unsupported (diagonals) */
 +};
-+
-+# endif // __ST_AUTOCOMPLETE_H
-\ No newline at end of file
-diff -ruN st.orig/config.def.h st/config.def.h
---- st.orig/config.def.h	2023-05-14 14:31:17.035380023 +0200
-+++ st/config.def.h	2023-05-14 14:40:06.656879202 +0200
+diff -ruN st.org/config.def.h st.patched/config.def.h
+--- st.org/config.def.h	2023-05-15 12:40:32.127067000 +0200
++++ st.patched/config.def.h	2023-05-15 14:22:23.158487000 +0200
 @@ -5,8 +5,8 @@
   *
   * font: see http://freedesktop.org/software/fontconfig/fontconfig-user.html
   */
 -static char *font = "Liberation Mono:pixelsize=12:antialias=true:autohint=true";
 -static int borderpx = 2;
-+static char *font = "Inconsolata LGS Nerd Font:pixelsize=16:antialias=true:autohint=true";
++static char *font = "Inconsolata LGC Nerd Font:pixelsize=18:antialias=true:autohint=true";
 +static int borderpx = 0;
  
  /*
   * What program is execed by st depends of these precedence rules:
-@@ -16,10 +16,10 @@
+@@ -16,7 +16,7 @@
   * 4: value of shell in /etc/passwd
   * 5: value of shell in config.h
   */
@@ -61,12 +459,27 @@ diff -ruN st.orig/config.def.h st/config.def.h
 +static char *shell = "/usr/bin/local/zsh";
  char *utmp = NULL;
  /* scroll program: to enable use a string like "scroll" */
--char *scroll = NULL;
-+char *scroll = "scroll";
- char *stty_args = "stty raw pass8 nl -echo -iexten -cstopb 38400";
+ char *scroll = NULL;
+@@ -68,6 +68,18 @@
+ static unsigned int cursorthickness = 2;
  
- /* identification sequence returned in DA and DECID */
-@@ -93,6 +93,9 @@
+ /*
++ * 1: render most of the lines/blocks characters without using the font for
++ *    perfect alignment between cells (U2500 - U259F except dashes/diagonals).
++ *    Bold affects lines thickness if boxdraw_bold is not 0. Italic is ignored.
++ * 0: disable (render all U25XX glyphs normally from the font).
++ */
++const int boxdraw = 0;
++const int boxdraw_bold = 0;
++
++/* braille (U28XX):  1: render as adjacent "pixels",  0: use font */
++const int boxdraw_braille = 0;
++
++/*
+  * bell volume. It must be a value between -100 and 100. Use 0 for disabling
+  * it
+  */
+@@ -93,6 +105,9 @@
   */
  unsigned int tabspaces = 8;
  
@@ -76,7 +489,7 @@ diff -ruN st.orig/config.def.h st/config.def.h
  /* Terminal colors (16 first used in escape sequence) */
  static const char *colorname[] = {
  	/* 8 normal colors */
-@@ -135,13 +138,25 @@
+@@ -135,13 +150,20 @@
  static unsigned int defaultrcs = 257;
  
  /*
@@ -85,94 +498,36 @@ diff -ruN st.orig/config.def.h st/config.def.h
 - * 4: Underline ("_")
 - * 6: Bar ("|")
 - * 7: Snowman ("☃")
-+- * Default shape of cursor
-+- * 2: Block ("█")
-+- * 4: Underline ("_")
-+- * 6: Bar ("|")
-+- * 7: Snowman ("☃")
-++ * https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h4-Functions-using-CSI-_-ordered-by-the-final-character-lparen-s-rparen:CSI-Ps-SP-q.1D81
-++ * Default style of cursor
-++ * 0: blinking block
-++ * 1: blinking block (default)
-++ * 2: steady block ("█")
-++ * 3: blinking underline
-++ * 4: steady underline ("_")
-++ * 5: blinking bar
-++ * 6: steady bar ("|")
-++ * 7: blinking st cursor
-++ * 8: steady st cursor
++ * https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h4-Functions-using-CSI-_-ordered-by-the-final-character-lparen-s-rparen:CSI-Ps-SP-q.1D81
++ * Default style of cursor
++ * 0: blinking block
++ * 1: blinking block (default)
++ * 2: steady block ("█")
++ * 3: blinking underline
++ * 4: steady underline ("_")
++ * 5: blinking bar
++ * 6: steady bar ("|")
++ * 7: blinking st cursor
++ * 8: steady st cursor
   */
 -static unsigned int cursorshape = 2;
-+static unsigned int cursorstyle = 0;
++static unsigned int cursorstyle = 1;
 +static Rune stcursor = 0x2603; /* snowman ("☃") */
  
  /*
   * Default columns and rows numbers
-@@ -169,6 +184,7 @@
-  * modifier, set to 0 to not use it.
-  */
- static uint forcemousemod = ShiftMask;
-+#include "autocomplete.h"
- 
- /*
-  * Internal mouse shortcuts.
-@@ -186,6 +202,7 @@
- /* Internal keyboard shortcuts. */
- #define MODKEY Mod1Mask
- #define TERMMOD (ControlMask|ShiftMask)
-+#define ACMPL_MOD ControlMask|Mod1Mask
- 
- static Shortcut shortcuts[] = {
- 	/* mask                 keysym          function        argument */
-@@ -201,6 +218,16 @@
+@@ -201,6 +223,8 @@
  	{ TERMMOD,              XK_Y,           selpaste,       {.i =  0} },
  	{ ShiftMask,            XK_Insert,      selpaste,       {.i =  0} },
  	{ TERMMOD,              XK_Num_Lock,    numlock,        {.i =  0} },
-+	{ ACMPL_MOD,            XK_slash,       autocomplete,   {.i = ACMPL_WORD        } },
-+	{ ACMPL_MOD,            XK_period,      autocomplete,   {.i = ACMPL_FUZZY_WORD  } },
-+	{ ACMPL_MOD,            XK_comma,       autocomplete,   {.i = ACMPL_FUZZY       } },
-+	{ ACMPL_MOD,            XK_apostrophe,  autocomplete,   {.i = ACMPL_SUFFIX      } },
-+	{ ACMPL_MOD,            XK_semicolon,   autocomplete,   {.i = ACMPL_SURROUND    } },
-+	{ ACMPL_MOD,            XK_bracketright,autocomplete,   {.i = ACMPL_WWORD       } },
-+	{ ACMPL_MOD,            XK_bracketleft, autocomplete,   {.i = ACMPL_FUZZY_WWORD } },
-+	{ ACMPL_MOD,            XK_equal,       autocomplete,   {.i = ACMPL_UNDO        } },
 +	{ ShiftMask,            XK_Page_Up,     kscrollup,      {.i = -1} },
 +	{ ShiftMask,            XK_Page_Down,   kscrolldown,    {.i = -1} },
  };
  
  /*
-@@ -472,3 +499,27 @@
- 	" !\"#$%&'()*+,-./0123456789:;<=>?"
- 	"@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_"
- 	"`abcdefghijklmnopqrstuvwxyz{|}~";
-+
-+/**
-+ * Undercurl style. Set UNDERCURL_STYLE to one of the available styles.
-+ *
-+ * Curly: Dunno how to draw it *shrug*
-+ *  _   _   _   _
-+ * ( ) ( ) ( ) ( )
-+ *	 (_) (_) (_) (_)
-+ *
-+ * Spiky:
-+ * /\  /\   /\	/\
-+ *   \/  \/	  \/
-+ *
-+ * Capped:
-+ *	_     _     _
-+ * / \   / \   / \
-+ *    \_/   \_/
-+ */
-+// Available styles
-+#define UNDERCURL_CURLY 0
-+#define UNDERCURL_SPIKY 1
-+#define UNDERCURL_CAPPED 2
-+// Active style
-+#define UNDERCURL_STYLE UNDERCURL_SPIKY
-\ No newline at end of file
-diff -ruN st.orig/config.mk st/config.mk
---- st.orig/config.mk	2023-05-14 14:31:17.035380023 +0200
-+++ st/config.mk	2023-05-14 13:56:06.257590200 +0200
+diff -ruN st.org/config.mk st.patched/config.mk
+--- st.org/config.mk	2023-05-15 12:40:32.127249000 +0200
++++ st.patched/config.mk	2023-05-15 14:15:24.120550000 +0200
 @@ -7,8 +7,8 @@
  PREFIX = /usr/local
  MANPREFIX = $(PREFIX)/share/man
@@ -184,378 +539,188 @@ diff -ruN st.orig/config.mk st/config.mk
  
  PKG_CONFIG = pkg-config
  
-@@ -16,7 +16,7 @@
+@@ -16,9 +16,11 @@
  INCS = -I$(X11INC) \
         `$(PKG_CONFIG) --cflags fontconfig` \
         `$(PKG_CONFIG) --cflags freetype2`
 -LIBS = -L$(X11LIB) -lm -lrt -lX11 -lutil -lXft \
++INCS = `$(PKG_CONFIG) --cflags harfbuzz`
 +LIBS = -L$(X11LIB) -lm -lrt -lX11 -lutil -lXft -lXrender\
         `$(PKG_CONFIG) --libs fontconfig` \
-        `$(PKG_CONFIG) --libs freetype2`
+-       `$(PKG_CONFIG) --libs freetype2`
++       `$(PKG_CONFIG) --libs freetype2` \
++       `$(PKG_CONFIG) --libs harfbuzz`
  
-@@ -24,13 +24,3 @@
+ # flags
  STCPPFLAGS = -DVERSION=\"$(VERSION)\" -D_XOPEN_SOURCE=600
- STCFLAGS = $(INCS) $(STCPPFLAGS) $(CPPFLAGS) $(CFLAGS)
- STLDFLAGS = $(LIBS) $(LDFLAGS)
--
--# OpenBSD:
--#CPPFLAGS = -DVERSION=\"$(VERSION)\" -D_XOPEN_SOURCE=600 -D_BSD_SOURCE
--#LIBS = -L$(X11LIB) -lm -lX11 -lutil -lXft \
--#       `$(PKG_CONFIG) --libs fontconfig` \
--#       `$(PKG_CONFIG) --libs freetype2`
--#MANPREFIX = ${PREFIX}/man
--
--# compiler and linker
--# CC = c99
-diff -ruN st.orig/st-autocomplete st/st-autocomplete
---- st.orig/st-autocomplete	1970-01-01 01:00:00.000000000 +0100
-+++ st/st-autocomplete	2023-05-14 14:21:11.696902249 +0200
-@@ -0,0 +1,310 @@
-+#!/usr/bin/perl
-+#########################################################################
-+# Copyright (C) 2012-2017  Wojciech Siewierski                          #
-+#                                                                       #
-+# This program is free software: you can redistribute it and/or modify  #
-+# it under the terms of the GNU General Public License as published by  #
-+# the Free Software Foundation, either version 3 of the License, or     #
-+# (at your option) any later version.                                   #
-+#                                                                       #
-+# This program is distributed in the hope that it will be useful,       #
-+# but WITHOUT ANY WARRANTY; without even the implied warranty of        #
-+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         #
-+# GNU General Public License for more details.                          #
-+#                                                                       #
-+# You should have received a copy of the GNU General Public License     #
-+# along with this program.  If not, see <http://www.gnu.org/licenses/>. #
-+#########################################################################
+diff -ruN st.org/hb.c st.patched/hb.c
+--- st.org/hb.c	1970-01-01 01:00:00.000000000 +0100
++++ st.patched/hb.c	2023-05-15 13:54:00.203769000 +0200
+@@ -0,0 +1,124 @@
++#include <stdlib.h>
++#include <stdio.h>
++#include <math.h>
++#include <X11/Xft/Xft.h>
++#include <X11/cursorfont.h>
++#include <hb.h>
++#include <hb-ft.h>
 +
-+my ($cmd, $cursor_row, $cursor_column) = @ARGV;
++#include "st.h"
++#include "hb.h"
 +
-+my $lines = [];
-+my $lines1 = [];
++#define FEATURE(c1,c2,c3,c4) { .tag = HB_TAG(c1,c2,c3,c4), .value = 1, .start = HB_FEATURE_GLOBAL_START, .end = HB_FEATURE_GLOBAL_END }
++#define BUFFER_STEP 256
 +
-+my $last_line = -1;
-+my $lines_before_cursor = 0;
++hb_font_t *hbfindfont(XftFont *match);
 +
-+while (<stdin>)
++typedef struct {
++	XftFont *match;
++	hb_font_t *font;
++} HbFontMatch;
++
++typedef struct {
++	size_t capacity;
++	HbFontMatch *fonts;
++} HbFontCache;
++
++static HbFontCache hbfontcache = { 0, NULL };
++
++typedef struct {
++	size_t capacity;
++	Rune *runes;
++} RuneBuffer;
++
++static RuneBuffer hbrunebuffer = { 0, NULL };
++
++/*
++ * Poplulate the array with a list of font features, wrapped in FEATURE macro,
++ * e. g.
++ * FEATURE('c', 'a', 'l', 't'), FEATURE('d', 'l', 'i', 'g')
++ */
++hb_feature_t features[] = { };
++
++void
++hbunloadfonts()
 +{
-+	$last_line++;
-+
-+	s/[^[:print:]]/?/g;
-+
-+	if ($last_line < $cursor_row)
-+	{
-+		unshift @{$lines1}, $_;
-+		$lines_before_cursor++;
++	for (int i = 0; i < hbfontcache.capacity; i++) {
++		hb_font_destroy(hbfontcache.fonts[i].font);
++		XftUnlockFace(hbfontcache.fonts[i].match);
 +	}
-+	else
-+	{
-+		unshift @{$lines}, $_;
++
++	if (hbfontcache.fonts != NULL) {
++		free(hbfontcache.fonts);
++		hbfontcache.fonts = NULL;
 +	}
++	hbfontcache.capacity = 0;
 +}
 +
-+foreach (@{$lines1})
++hb_font_t *
++hbfindfont(XftFont *match)
 +{
-+	unshift @{$lines}, $_;
-+}
-+
-+my $cursor_row_in = $cursor_row;
-+
-+$cursor_row = $last_line;
-+
-+
-+$self = {};
-+
-+# A reference to a function that transforms the completed word
-+# into a regex matching the completions. Usually generated by
-+# generate_matcher().
-+#
-+# For example
-+#   $fun = generate_matcher(".*");
-+#   $fun->("foo");
-+# would return "f.*o.*o"
-+#
-+# In other words, indirectly decides which characters can
-+# appear in the completion.
-+my $matcher;
-+
-+# A regular expression matching a character before each match.
-+# For example, it you want to match the text after a
-+# whitespace, set it to "\s".
-+my $char_class_before;
-+
-+# A regular expression matching every character in the entered
-+# text that will be used to find matching completions. Usually
-+# "\w" or similar.
-+my $char_class_to_complete;
-+
-+# A regular expression matching every allowed last character
-+# of the completion (uses greedy matching).
-+my $char_class_at_end;
-+
-+if ($cmd eq 'word-complete') {
-+	# Basic word completion. Completes the current word
-+	# without any special matching.
-+	$char_class_before      = '[^-\w]';
-+	$matcher                = sub { quotemeta shift }; # identity
-+	$char_class_at_end      = '[-\w]';
-+	$char_class_to_complete = '[-\w]';
-+} elsif ($cmd eq 'WORD-complete') {
-+	# The same as above but in the Vim meaning of a "WORD" --
-+	# whitespace delimited.
-+	$char_class_before      = '\s';
-+	$matcher                = sub { quotemeta shift };
-+	$char_class_at_end      = '\S';
-+	$char_class_to_complete = '\S';
-+} elsif ($cmd eq 'fuzzy-word-complete' ||
-+		 $cmd eq 'skeleton-word-complete') {
-+	# Fuzzy completion of the current word.
-+	$char_class_before      = '[^-\w]';
-+	$matcher                = generate_matcher('[-\w]*');
-+	$char_class_at_end      = '[-\w]';
-+	$char_class_to_complete = '[-\w]';
-+} elsif ($cmd eq 'fuzzy-WORD-complete') {
-+	# Fuzzy completion of the current WORD.
-+	$char_class_before      = '\s';
-+	$matcher                = generate_matcher('\S*');
-+	$char_class_at_end      = '\S';
-+	$char_class_to_complete = '\S';
-+} elsif ($cmd eq 'fuzzy-complete' ||
-+		 $cmd eq 'skeleton-complete') {
-+	# Fuzzy completion of an arbitrary text.
-+	$char_class_before      = '\W';
-+	$matcher                = generate_matcher('.*?');
-+	$char_class_at_end      = '\w';
-+	$char_class_to_complete = '\S';
-+} elsif ($cmd eq 'suffix-complete') {
-+	# Fuzzy completion of an completing suffixes, like
-+	# completing test=hello from /blah/hello.
-+	$char_class_before      = '\S';
-+	$matcher                = generate_matcher('\S*');
-+	$char_class_at_end      = '\S';
-+	$char_class_to_complete = '\S';
-+} elsif ($cmd eq 'surround-complete') {
-+	# Completing contents of quotes and braces.
-+
-+	# Here we are using three named groups: s, b, p for quotes, braces
-+	# and parenthesis.
-+	$char_class_before      = '((?<q>["\'`])|(?<b>\[)|(?<p>\())';
-+
-+	$matcher                = generate_matcher('.*?');
-+
-+	# Here we match text till enclosing pair, using perl conditionals in
-+	# regexps (?(condition)yes-expression|no-expression).
-+	# \0 is used to hack concatenation with '*' later in the code.
-+	$char_class_at_end      = '.*?(.(?=(?(<b>)\]|((?(<p>)\)|\g{q})))))\0';
-+	$char_class_to_complete = '\S';
-+}
-+
-+
-+# use the last used word or read the word behind the cursor
-+my $word_to_complete = read_word_at_coord($self, $cursor_row, $cursor_column,
-+										  $char_class_to_complete);
-+
-+print stdout "$word_to_complete\n";
-+
-+if ($word_to_complete) {
-+	while (1) {
-+		# ignore the completed word itself
-+		$self->{already_completed}{$word_to_complete} = 1;
-+
-+		# continue the last search or start from the current row
-+		my $completion = find_match($self,
-+									$word_to_complete,
-+									$self->{next_row} // $cursor_row,
-+									$matcher->($word_to_complete),
-+									$char_class_before,
-+									$char_class_at_end);
-+		if ($completion) {
-+			print stdout $completion."\n".join ("\n", @{$self->{highlight}})."\n";
-+		}
-+		else {
-+			last;
-+		}
-+	}
-+}
-+
-+######################################################################
-+
-+sub highlight_match {
-+    my ($self, $linenum, $completion) = @_;
-+
-+    # clear_highlight($self);
-+
-+    my $line = @{$lines}[$linenum];
-+    my $re = quotemeta $completion;
-+
-+    $line =~ /$re/;
-+
-+    my $beg = $-[0];
-+    my $end = $+[0];
-+
-+	if ($linenum >= $lines_before_cursor)
-+	{
-+		$lline = $last_line - $lines_before_cursor;
-+		$linenum -= $lines_before_cursor;
-+		$linenum = $lline - $linenum;
-+		$linenum += $lines_before_cursor;
++	for (int i = 0; i < hbfontcache.capacity; i++) {
++		if (hbfontcache.fonts[i].match == match)
++			return hbfontcache.fonts[i].font;
 +	}
 +
++	/* Font not found in cache, caching it now. */
++	hbfontcache.fonts = realloc(hbfontcache.fonts, sizeof(HbFontMatch) * (hbfontcache.capacity + 1));
++	FT_Face face = XftLockFace(match);
++	hb_font_t *font = hb_ft_font_create(face, NULL);
++	if (font == NULL)
++		die("Failed to load Harfbuzz font.");
 +
-+    $self->{highlight} = [$linenum, $beg, $end];
++	hbfontcache.fonts[hbfontcache.capacity].match = match;
++	hbfontcache.fonts[hbfontcache.capacity].font = font;
++	hbfontcache.capacity += 1;
++
++	return font;
 +}
 +
-+######################################################################
++void hbtransform(HbTransformData *data, XftFont *xfont, const Glyph *glyphs, int start, int length) {
++	ushort mode = USHRT_MAX;
++	unsigned int glyph_count;
++	int rune_idx, glyph_idx, end = start + length;
 +
-+sub read_word_at_coord {
-+    my ($self, $row, $col, $char_class) = @_;
++	hb_font_t *font = hbfindfont(xfont);
++	if (font == NULL)
++		return;
 +
-+    $_ = substr(@{$lines} [$row], 0, $col); # get the current line up to the cursor...
-+    s/.*?($char_class*)$/$1/;               # ...and read the last word from it
-+    return $_;
-+}
++	hb_buffer_t *buffer = hb_buffer_create();
++	hb_buffer_set_direction(buffer, HB_DIRECTION_LTR);
 +
-+######################################################################
-+
-+# Returns a function that takes a string and returns that string with
-+# this function's argument inserted between its every two characters.
-+# The resulting string is used as a regular expression matching the
-+# completion candidates.
-+sub generate_matcher {
-+    my $regex_between = shift;
-+
-+    sub {
-+        $_ = shift;
-+
-+        # sorry for this lispy code, I couldn't resist ;)
-+        (join "$regex_between",
-+         (map quotemeta,
-+          (split //)))
-+    }
-+}
-+
-+######################################################################
-+
-+# Checks whether the completion found by find_match() was already
-+# found and if it was, calls find_match() again to find the next
-+# completion.
-+#
-+# Takes all the arguments that find_match() would take, to make a
-+# mutually recursive call.
-+sub skip_duplicates {
-+    my ($self, $word_to_match, $current_row, $regexp, $char_class_before, $char_class_at_end) = @_;
-+    my $completion;
-+
-+	if ($current_row <= $lines_before_cursor)
-+	{
-+		$completion = shift @{$self->{matches_in_row}}; # get the leftmost one
-+	}
-+	else
-+	{
-+		$completion = pop @{$self->{matches_in_row}}; # get the leftmost one
++	/* Resize the buffer if required length is larger. */
++	if (hbrunebuffer.capacity < length) {
++		hbrunebuffer.capacity = (length / BUFFER_STEP + 1) * BUFFER_STEP;
++		hbrunebuffer.runes = realloc(hbrunebuffer.runes, hbrunebuffer.capacity);
 +	}
 +
-+    # check for duplicates
-+    if (exists $self->{already_completed}{$completion}) {
-+        # skip this completion
-+        return find_match(@_);
-+    } else {
-+        $self->{already_completed}{$completion} = 1;
++	/* Fill buffer with codepoints. */
++	for (rune_idx = 0, glyph_idx = start; glyph_idx < end; glyph_idx++, rune_idx++) {
++		hbrunebuffer.runes[rune_idx] = glyphs[glyph_idx].u;
++		mode = glyphs[glyph_idx].mode;
++		if (mode & ATTR_WDUMMY)
++			hbrunebuffer.runes[rune_idx] = 0x0020;
++	}
++	hb_buffer_add_codepoints(buffer, hbrunebuffer.runes, length, 0, length);
 +
-+		highlight_match($self,
-+						$self->{next_row}+1,
-+						$completion);
++	/* Shape the segment. */
++	hb_shape(font, buffer, features, sizeof(features)/sizeof(hb_feature_t));
 +
-+        return $completion;
-+    }
++	/* Get new glyph info. */
++	hb_glyph_info_t *info = hb_buffer_get_glyph_infos(buffer, &glyph_count);
++	hb_glyph_position_t *pos = hb_buffer_get_glyph_positions(buffer, &glyph_count);
++
++	/* Fill the output. */
++	data->buffer = buffer;
++	data->glyphs = info;
++	data->positions = pos;
++	data->count = glyph_count;
 +}
 +
-+######################################################################
-+
-+# Finds the next matching completion in the row current row or above
-+# while skipping duplicates using skip_duplicates().
-+sub find_match {
-+    my ($self, $word_to_match, $current_row, $regexp, $char_class_before, $char_class_at_end) = @_;
-+    $self->{matches_in_row} //= [];
-+
-+    # cycle through all the matches in the current row if not starting a new search
-+    if (@{$self->{matches_in_row}}) {
-+        return skip_duplicates($self, $word_to_match, $current_row, $regexp, $char_class_before, $char_class_at_end);
-+    }
-+
-+
-+    my $i;
-+    # search through all the rows starting with current one or one above the last checked
-+    for ($i = $current_row; $i >= 0; --$i) {
-+        my $line = @{$lines}[$i];   # get the line of text from the row
-+
-+        # if ($i == $cursor_row) {
-+        #     $line = substr $line, 0, $cursor_column;
-+        # }
-+
-+        $_ = $line;
-+
-+        # find all the matches in the current line
-+        my $match;
-+        push @{$self->{matches_in_row}}, $+{match} while ($_, $match) = /
-+                                                                         (.*${char_class_before})
-+                                                                         (?<match>
-+                                                                             ${regexp}
-+                                                                             ${char_class_at_end}*
-+                                                                         )
-+                                                                     /ix;
-+        # corner case: match at the very beginning of line
-+        push @{$self->{matches_in_row}}, $+{match} if $line =~ /^(${char_class_before}){0}(?<match>$regexp$char_class_at_end*)/i;
-+
-+        if (@{$self->{matches_in_row}}) {
-+            # remember which row should be searched next
-+            $self->{next_row} = --$i;
-+
-+            # arguments needed for find_match() mutual recursion
-+            return skip_duplicates($self, $word_to_match, $i, $regexp, $char_class_before, $char_class_at_end);
-+        }
-+    }
-+
-+    # # no more possible completions, revert to the original word
-+    # undo_completion($self) if $i < 0;
-+
-+    return undef;
++void hbcleanup(HbTransformData *data) {
++	hb_buffer_destroy(data->buffer);
++	memset(data, 0, sizeof(HbTransformData));
 +}
-\ No newline at end of file
-diff -ruN st.orig/st.c st/st.c
---- st.orig/st.c	2023-05-14 14:31:17.035380023 +0200
-+++ st/st.c	2023-05-14 15:27:45.757712008 +0200
-@@ -17,6 +17,8 @@
- #include <unistd.h>
- #include <wchar.h>
- 
-+#include "autocomplete.h"
+diff -ruN st.org/hb.h st.patched/hb.h
+--- st.org/hb.h	1970-01-01 01:00:00.000000000 +0100
++++ st.patched/hb.h	2023-05-15 14:11:44.982884000 +0200
+@@ -0,0 +1,14 @@
++#include <X11/Xft/Xft.h>
++#include <hb.h>
++#include <hb-ft.h>
 +
- #include "st.h"
- #include "win.h"
- 
-@@ -33,8 +35,10 @@
- #define UTF_SIZ       4
- #define ESC_BUF_SIZ   (128*UTF_SIZ)
++typedef struct {
++  hb_buffer_t *buffer;
++  hb_glyph_info_t *glyphs;
++  hb_glyph_position_t *positions;
++  unsigned int count;
++} HbTransformData;
++
++void hbunloadfonts();
++void hbtransform(HbTransformData *, XftFont *, const Glyph *, int, int);
++void hbcleanup(HbTransformData *);
+diff -ruN st.org/st.c st.patched/st.c
+--- st.org/st.c	2023-05-15 12:40:32.128702000 +0200
++++ st.patched/st.c	2023-05-15 13:59:36.772278000 +0200
+@@ -35,6 +35,7 @@
  #define ESC_ARG_SIZ   16
-+#define CAR_PER_ARG   4
  #define STR_BUF_SIZ   ESC_BUF_SIZ
  #define STR_ARG_SIZ   ESC_ARG_SIZ
 +#define HISTSIZE      2000
  
  /* macros */
  #define IS_SET(flag)		((term.mode & (flag)) != 0)
-@@ -42,6 +46,9 @@
+@@ -42,6 +43,9 @@
  #define ISCONTROLC1(c)		(BETWEEN(c, 0x80, 0x9f))
  #define ISCONTROL(c)		(ISCONTROLC0(c) || ISCONTROLC1(c))
  #define ISDELIM(u)		(u && wcschr(worddelimiters, u))
 +#define TLINE(y)		((y) < term.scr ? term.hist[((y) + term.histi - \
-+						term.scr + HISTSIZE + 1) % HISTSIZE] : \
-+						term.line[(y) - term.scr])
++				term.scr + HISTSIZE + 1) % HISTSIZE] : \
++				term.line[(y) - term.scr])
  
  enum term_mode {
  	MODE_WRAP        = 1 << 0,
-@@ -115,6 +122,9 @@
+@@ -115,6 +119,9 @@
  	int col;      /* nb col */
  	Line *line;   /* screen */
  	Line *alt;    /* alternate screen */
@@ -565,23 +730,7 @@ diff -ruN st.orig/st.c st/st.c
  	int *dirty;   /* dirtyness of lines */
  	TCursor c;    /* cursor */
  	int ocx;      /* old cursor col */
-@@ -139,6 +149,7 @@
- 	int arg[ESC_ARG_SIZ];
- 	int narg;              /* nb of args */
- 	char mode[2];
-+	int carg[ESC_ARG_SIZ][CAR_PER_ARG]; /* colon args */
- } CSIEscape;
- 
- /* STR Escape sequence structs */
-@@ -159,6 +170,7 @@
- 
- static void csidump(void);
- static void csihandle(void);
-+static void readcolonargs(char **, int, int[][CAR_PER_ARG]);
- static void csiparse(void);
- static void csireset(void);
- static void osc_color_response(int, int, int);
-@@ -185,8 +197,8 @@
+@@ -185,8 +192,8 @@
  static void tputtab(int);
  static void tputc(Rune);
  static void treset(void);
@@ -592,7 +741,7 @@ diff -ruN st.orig/st.c st/st.c
  static void tsetattr(const int *, int);
  static void tsetchar(Rune, const Glyph *, int, int);
  static void tsetdirt(int, int);
-@@ -409,10 +421,10 @@
+@@ -409,10 +416,10 @@
  {
  	int i = term.col;
  
@@ -605,7 +754,7 @@ diff -ruN st.orig/st.c st/st.c
  		--i;
  
  	return i;
-@@ -521,7 +533,7 @@
+@@ -521,7 +528,7 @@
  		 * Snap around if the word wraps around at the end or
  		 * beginning of a line.
  		 */
@@ -614,7 +763,7 @@ diff -ruN st.orig/st.c st/st.c
  		prevdelim = ISDELIM(prevgp->u);
  		for (;;) {
  			newx = *x + direction;
-@@ -536,14 +548,14 @@
+@@ -536,14 +543,14 @@
  					yt = *y, xt = *x;
  				else
  					yt = newy, xt = newx;
@@ -631,7 +780,7 @@ diff -ruN st.orig/st.c st/st.c
  			delim = ISDELIM(gp->u);
  			if (!(gp->mode & ATTR_WDUMMY) && (delim != prevdelim
  					|| (delim && gp->u != prevgp->u)))
-@@ -564,14 +576,14 @@
+@@ -564,14 +571,14 @@
  		*x = (direction < 0) ? 0 : term.col - 1;
  		if (direction < 0) {
  			for (; *y > 0; *y += direction) {
@@ -648,7 +797,7 @@ diff -ruN st.orig/st.c st/st.c
  						& ATTR_WRAP)) {
  					break;
  				}
-@@ -602,13 +614,13 @@
+@@ -602,13 +609,13 @@
  		}
  
  		if (sel.type == SEL_RECTANGULAR) {
@@ -665,23 +814,24 @@ diff -ruN st.orig/st.c st/st.c
  		while (last >= gp && last->u == ' ')
  			--last;
  
-@@ -844,6 +856,9 @@
+@@ -844,7 +851,10 @@
  ttywrite(const char *s, size_t n, int may_echo)
  {
  	const char *next;
 +	Arg arg = (Arg) { .i = term.scr };
-+
-+	kscrolldown(&arg);
  
++	kscrolldown(&arg);
++
  	if (may_echo && IS_SET(MODE_ECHO))
  		twrite(s, n, 1);
-@@ -1055,13 +1070,53 @@
+ 
+@@ -1055,13 +1065,53 @@
  }
  
  void
 -tscrolldown(int orig, int n)
 +kscrolldown(const Arg* a)
-+{
+ {
 +	int n = a->i;
 +
 +	if (n < 0)
@@ -714,23 +864,23 @@ diff -ruN st.orig/st.c st/st.c
 +
 +void
 +tscrolldown(int orig, int n, int copyhist)
- {
++{
  	int i;
  	Line temp;
  
  	LIMIT(n, 0, term.bot-orig+1);
- 
 +	if (copyhist) {
 +		term.histi = (term.histi - 1 + HISTSIZE) % HISTSIZE;
 +		temp = term.hist[term.histi];
 +		term.hist[term.histi] = term.line[term.bot];
 +		term.line[term.bot] = temp;
 +	}
+ 
 +
  	tsetdirt(orig, term.bot-n);
  	tclearregion(0, term.bot-n+1, term.col-1, term.bot);
  
-@@ -1071,17 +1126,28 @@
+@@ -1071,17 +1121,28 @@
  		term.line[i-n] = temp;
  	}
  
@@ -761,7 +911,7 @@ diff -ruN st.orig/st.c st/st.c
  	tclearregion(0, orig, term.col-1, orig+n-1);
  	tsetdirt(orig+n, term.bot);
  
-@@ -1091,7 +1157,8 @@
+@@ -1091,7 +1152,8 @@
  		term.line[i+n] = temp;
  	}
  
@@ -771,7 +921,7 @@ diff -ruN st.orig/st.c st/st.c
  }
  
  void
-@@ -1120,7 +1187,7 @@
+@@ -1120,7 +1182,7 @@
  	int y = term.c.y;
  
  	if (y == term.bot) {
@@ -780,44 +930,17 @@ diff -ruN st.orig/st.c st/st.c
  	} else {
  		y++;
  	}
-@@ -1128,6 +1195,28 @@
+@@ -1215,6 +1277,9 @@
+ 	term.dirty[y] = 1;
+ 	term.line[y][x] = *attr;
+ 	term.line[y][x].u = u;
++
++	if (isboxdraw(u))
++		term.line[y][x].mode |= ATTR_BOXDRAW;
  }
  
  void
-+readcolonargs(char **p, int cursor, int params[][CAR_PER_ARG])
-+{
-+	int i = 0;
-+	for (; i < CAR_PER_ARG; i++)
-+		params[cursor][i] = -1;
-+
-+	if (**p != ':')
-+		return;
-+
-+	char *np = NULL;
-+	i = 0;
-+
-+	while (**p == ':' && i < CAR_PER_ARG) {
-+		while (**p == ':')
-+			(*p)++;
-+		params[cursor][i] = strtol(*p, &np, 10);
-+		*p = np;
-+		i++;
-+	}
-+}
-+
-+void
- csiparse(void)
- {
- 	char *p = csiescseq.buf, *np;
-@@ -1149,6 +1238,7 @@
- 			v = -1;
- 		csiescseq.arg[csiescseq.narg++] = v;
- 		p = np;
-+		readcolonargs(&p, csiescseq.narg-1, csiescseq.carg);
- 		if (*p != ';' || csiescseq.narg == ESC_ARG_SIZ)
- 			break;
- 		p++;
-@@ -1285,14 +1375,14 @@
+@@ -1285,14 +1350,14 @@
  tinsertblankline(int n)
  {
  	if (BETWEEN(term.c.y, term.top, term.bot))
@@ -834,53 +957,7 @@ diff -ruN st.orig/st.c st/st.c
  }
  
  int32_t
-@@ -1365,6 +1455,10 @@
- 				ATTR_STRUCK     );
- 			term.c.attr.fg = defaultfg;
- 			term.c.attr.bg = defaultbg;
-+			term.c.attr.ustyle = -1;
-+			term.c.attr.ucolor[0] = -1;
-+			term.c.attr.ucolor[1] = -1;
-+			term.c.attr.ucolor[2] = -1;
- 			break;
- 		case 1:
- 			term.c.attr.mode |= ATTR_BOLD;
-@@ -1376,7 +1470,14 @@
- 			term.c.attr.mode |= ATTR_ITALIC;
- 			break;
- 		case 4:
--			term.c.attr.mode |= ATTR_UNDERLINE;
-+			term.c.attr.ustyle = csiescseq.carg[i][0];
-+
-+			if (term.c.attr.ustyle != 0)
-+				term.c.attr.mode |= ATTR_UNDERLINE;
-+			else
-+				term.c.attr.mode &= ~ATTR_UNDERLINE;
-+
-+			term.c.attr.mode ^= ATTR_DIRTYUNDERLINE;
- 			break;
- 		case 5: /* slow blink */
- 			/* FALLTHROUGH */
-@@ -1427,6 +1528,18 @@
- 		case 49:
- 			term.c.attr.bg = defaultbg;
- 			break;
-+		case 58:
-+			term.c.attr.ucolor[0] = csiescseq.carg[i][1];
-+			term.c.attr.ucolor[1] = csiescseq.carg[i][2];
-+			term.c.attr.ucolor[2] = csiescseq.carg[i][3];
-+			term.c.attr.mode ^= ATTR_DIRTYUNDERLINE;
-+			break;
-+		case 59:
-+			term.c.attr.ucolor[0] = -1;
-+			term.c.attr.ucolor[1] = -1;
-+			term.c.attr.ucolor[2] = -1;
-+			term.c.attr.mode ^= ATTR_DIRTYUNDERLINE;
-+			break;
- 		default:
- 			if (BETWEEN(attr[i], 30, 37)) {
- 				term.c.attr.fg = attr[i] - 30;
-@@ -1729,11 +1842,11 @@
+@@ -1729,11 +1794,11 @@
  		break;
  	case 'S': /* SU -- Scroll <n> line up */
  		DEFAULT(csiescseq.arg[0], 1);
@@ -894,7 +971,7 @@ diff -ruN st.orig/st.c st/st.c
  		break;
  	case 'L': /* IL -- Insert <n> blank lines */
  		DEFAULT(csiescseq.arg[0], 1);
-@@ -2305,7 +2418,7 @@
+@@ -2305,7 +2370,7 @@
  		return 0;
  	case 'D': /* IND -- Linefeed */
  		if (term.c.y == term.bot) {
@@ -903,7 +980,7 @@ diff -ruN st.orig/st.c st/st.c
  		} else {
  			tmoveto(term.c.x, term.c.y+1);
  		}
-@@ -2318,7 +2431,7 @@
+@@ -2318,7 +2383,7 @@
  		break;
  	case 'M': /* RI -- Reverse index */
  		if (term.c.y == term.top) {
@@ -912,7 +989,7 @@ diff -ruN st.orig/st.c st/st.c
  		} else {
  			tmoveto(term.c.x, term.c.y-1);
  		}
-@@ -2535,7 +2648,7 @@
+@@ -2535,7 +2600,7 @@
  void
  tresize(int col, int row)
  {
@@ -921,7 +998,7 @@ diff -ruN st.orig/st.c st/st.c
  	int minrow = MIN(row, term.row);
  	int mincol = MIN(col, term.col);
  	int *bp;
-@@ -2572,6 +2685,14 @@
+@@ -2572,6 +2637,14 @@
  	term.dirty = xrealloc(term.dirty, row * sizeof(*term.dirty));
  	term.tabs = xrealloc(term.tabs, col * sizeof(*term.tabs));
  
@@ -936,7 +1013,7 @@ diff -ruN st.orig/st.c st/st.c
  	/* resize each row to new width, zero-pad if needed */
  	for (i = 0; i < minrow; i++) {
  		term.line[i] = xrealloc(term.line[i], col * sizeof(Glyph));
-@@ -2630,7 +2751,7 @@
+@@ -2630,7 +2703,7 @@
  			continue;
  
  		term.dirty[y] = 0;
@@ -945,7 +1022,7 @@ diff -ruN st.orig/st.c st/st.c
  	}
  }
  
-@@ -2651,8 +2772,9 @@
+@@ -2651,8 +2724,9 @@
  		cx--;
  
  	drawregion(0, 0, term.col, term.row);
@@ -953,279 +1030,32 @@ diff -ruN st.orig/st.c st/st.c
 -			term.ocx, term.ocy, term.line[term.ocy][term.ocx]);
 +	if (term.scr == 0)
 +		xdrawcursor(cx, term.c.y, term.line[term.c.y][cx],
-+				term.ocx, term.ocy, term.line[term.ocy][term.ocx]);
++				term.ocx, term.ocy, term.line[term.ocy][term.ocx], term.line[term.ocy], term.col);
  	term.ocx = cx;
  	term.ocy = term.c.y;
  	xfinishdraw();
-@@ -2666,3 +2788,241 @@
- 	tfulldirt();
- 	draw();
- }
-+
-+void autocomplete (const Arg * arg)
-+{
-+	static _Bool active = 0;
-+
-+	int acmpl_cmdindex = arg -> i;
-+
-+	static int acmpl_cmdindex_prev;
-+
-+	if (active == 0)
-+		acmpl_cmdindex_prev = acmpl_cmdindex;
-+
-+	static const char * const (acmpl_cmd []) = {
-+		[ACMPL_DEACTIVATE]	= "__DEACTIVATE__",
-+		[ACMPL_WORD]		= "word-complete",
-+		[ACMPL_WWORD]		= "WORD-complete",
-+		[ACMPL_FUZZY_WORD]	= "fuzzy-word-complete",
-+		[ACMPL_FUZZY_WWORD]	= "fuzzy-WORD-complete",
-+		[ACMPL_FUZZY]		= "fuzzy-complete",
-+		[ACMPL_SUFFIX]		= "suffix-complete",
-+		[ACMPL_SURROUND]	= "surround-complete",
-+		[ACMPL_UNDO]		= "__UNDO__",
-+	};
-+
-+	static char acmpl [1000];		// ACMPL_ISSUE: why 1000?
-+
-+	static FILE * acmpl_exec = NULL;
-+	static int acmpl_status;
-+
-+	static const char * stbuffile;
-+	static char target [1000];		// ACMPL_ISSUE: why 1000? dynamically allocate char array of size term.col
-+	static size_t targetlen;
-+
-+	static char completion [1000] = {0};		// ACMPL_ISSUE: why 1000? dynamically allocate char array of size term.col
-+	static size_t complen_prev = 0;		// NOTE: always clear this variable after clearing completion
-+
-+	static int cx, cy;
-+
-+	// ACMPL_ISSUE: crashes when term.row is too small
-+
-+// Check for deactivation
-+
-+	if (acmpl_cmdindex == ACMPL_DEACTIVATE)
-+	{
-+
-+//     Deactivate autocomplete mode keeping current completion
-+
-+		if (active)
-+		{
-+			active = 0;
-+			pclose (acmpl_exec);
-+			remove (stbuffile);
-+
-+			if (complen_prev)
-+			{
-+				selclear ();
-+				complen_prev = 0;
-+			}
-+		}
-+
-+		return;
-+	}
-+
-+// Check for undo
-+
-+	if (acmpl_cmdindex == ACMPL_UNDO)
-+	{
-+
-+//     Deactivate autocomplete mode recovering target
-+
-+		if (active)
-+		{
-+			active = 0;
-+			pclose (acmpl_exec);
-+			remove (stbuffile);
-+
-+			if (complen_prev)
-+			{
-+				selclear ();
-+				for (size_t i = 0; i < complen_prev; i++)
-+					ttywrite ((char []) { '\b' }, 1, 1);	// ACMPL_ISSUE: I'm not sure that this is the right way
-+				complen_prev = 0;
-+				ttywrite (target, targetlen, 0);		// ACMPL_ISSUE: I'm not sure that this is a right solution
-+			}
-+		}
-+
-+		return;
-+	}
-+
-+// Check for command change
-+
-+	if (acmpl_cmdindex != acmpl_cmdindex_prev)
-+	{
-+
-+//     If command is changed, goto acmpl_begin avoiding rewriting st buffer
-+
-+		if (active)
-+		{
-+			acmpl_cmdindex_prev = acmpl_cmdindex;
-+
-+			goto acmpl_begin;
-+		}
-+	}
-+
-+// If not active
-+
-+	if (active == 0)
-+	{
-+		acmpl_cmdindex_prev = acmpl_cmdindex;
-+		cx = term.c.x;
-+		cy = term.c.y;
-+
-+//     Write st buffer to a temp file
-+
-+		stbuffile = tmpnam (NULL);		// ACMPL_ISSUE: check for return value ...
-+										// ACMPL_ISSUE: use coprocesses instead of temp files
-+
-+		FILE * stbuf = fopen (stbuffile, "w"); // ACMPL_ISSUE: check for opening error ...
-+		char * stbufline = malloc (term.col + 2); // ACMPL_ISSUE: check for allocating error ...
-+
-+		for (size_t y = 0; y < term.row; y++)
-+		{
-+			size_t x = 0;
-+			for (; x < term.col; x++)
-+				utf8encode (term.line [y] [x].u, stbufline + x);
-+			if (term.line [y] [x - 1].mode & ATTR_WRAP)
-+			{
-+				x--;
-+				if (y <= cy) cy--;
-+			}
-+			else
-+			{
-+				stbufline [x] = '\n';
-+			}
-+			stbufline [x + 1] = 0;
-+			fputs (stbufline, stbuf);
-+		}
-+
-+		free (stbufline);
-+		fclose (stbuf);
-+
-+acmpl_begin:
-+
-+//     Run st-autocomplete
-+
-+		sprintf (
-+			acmpl,
-+			"cat %100s | st-autocomplete %500s %d %d",	// ACMPL_ISSUE: why 100 and 500?
-+			stbuffile,
-+			acmpl_cmd [acmpl_cmdindex],
-+			cy,
-+			cx
-+		);
-+
-+		acmpl_exec = popen (acmpl, "r");		// ACMPL_ISSUE: popen isn't defined by The Standard. Does it work in BSDs for example?
-+												// ACMPL_ISSUE: check for popen error ...
-+
-+//     Read the target, targetlen
-+
-+		fscanf (acmpl_exec, "%500s\n", target); // ACMPL_ISSUE: check for scanning error ...
-+		targetlen = strlen (target);
-+	}
-+
-+// Read a completion if exists (acmpl_status)
-+
-+	unsigned line, beg, end;
-+
-+	acmpl_status = fscanf (acmpl_exec, "%500s %u %u %u\n", completion, & line, & beg, & end);
-+												// ACMPL_ISSUE: why 500? use term.col instead
-+
-+// Exit if no completions found
-+
-+	if (active == 0 && acmpl_status == EOF)
-+	{
-+
-+//    Close st-autocomplete and exit without activating the autocomplete mode
-+
-+		pclose (acmpl_exec);
-+		remove (stbuffile);
-+		return;
-+	}
-+
-+// If completions found, enable autocomplete mode and autocomplete the target
-+
-+	active = 1;
-+
-+// Clear target before first completion
-+
-+	if (complen_prev == 0)
-+	{
-+		for (size_t i = 0; i < targetlen; i++)
-+			ttywrite ((char []) { '\b' }, 1, 1);	// ACMPL_ISSUE: I'm not sure that this is a right solution
-+	}
-+
-+// Clear previuos completion if this is not the first
-+
-+	else
-+	{
-+		selclear ();
-+		for (size_t i = 0; i < complen_prev; i++)
-+			ttywrite ((char []) { '\b' }, 1, 1);	// ACMPL_ISSUE: I'm not sure that this is a right solution
-+		complen_prev = 0;
-+	}
-+
-+// If no more completions found, reset and restart
-+
-+	if (acmpl_status == EOF)
-+	{
-+		active = 0;
-+		pclose (acmpl_exec);
-+		ttywrite (target, targetlen, 0);
-+		goto acmpl_begin;
-+	}
-+
-+// Count wrapped lines before the current line
-+
-+	int wl = 0;
-+
-+	int tl = line;
-+
-+	for (int l = 0; l < tl; l++)
-+		if (term.line [l] [term.col - 1].mode & ATTR_WRAP)
-+		{
-+			wl++;
-+			tl++;
-+		}
-+
-+// Read the new completion and autcomplete
-+
-+	end--;
-+
-+	selstart (beg, line + wl, 0);
-+	selextend (end % term.col, line + wl + end / term.col, 1, 0);
-+	xsetsel (getsel ());
-+
-+	complen_prev = strlen (completion);
-+	ttywrite (completion, complen_prev, 0);
-+}
-diff -ruN st.orig/st.h st/st.h
---- st.orig/st.h	2023-05-14 14:31:17.035380023 +0200
-+++ st/st.h	2023-05-14 14:35:06.576576201 +0200
-@@ -34,6 +34,7 @@
+diff -ruN st.org/st.h st.patched/st.h
+--- st.org/st.h	2023-05-15 12:40:32.128996000 +0200
++++ st.patched/st.h	2023-05-15 13:54:00.204790000 +0200
+@@ -11,7 +11,8 @@
+ #define DIVCEIL(n, d)		(((n) + ((d) - 1)) / (d))
+ #define DEFAULT(a, b)		(a) = (a) ? (a) : (b)
+ #define LIMIT(x, a, b)		(x) = (x) < (a) ? (a) : (x) > (b) ? (b) : (x)
+-#define ATTRCMP(a, b)		((a).mode != (b).mode || (a).fg != (b).fg || \
++#define ATTRCMP(a, b)		(((a).mode & (~ATTR_WRAP)) != ((b).mode & (~ATTR_WRAP)) || \
++				(a).fg != (b).fg || \
+ 				(a).bg != (b).bg)
+ #define TIMEDIFF(t1, t2)	((t1.tv_sec-t2.tv_sec)*1000 + \
+ 				(t1.tv_nsec-t2.tv_nsec)/1E6)
+@@ -33,6 +34,7 @@
+ 	ATTR_WRAP       = 1 << 8,
  	ATTR_WIDE       = 1 << 9,
  	ATTR_WDUMMY     = 1 << 10,
++	ATTR_BOXDRAW    = 1 << 11,
  	ATTR_BOLD_FAINT = ATTR_BOLD | ATTR_FAINT,
-+	ATTR_DIRTYUNDERLINE = 1 << 15,
  };
  
- enum selection_mode {
-@@ -65,6 +66,8 @@
- 	ushort mode;      /* attribute flags */
- 	uint32_t fg;      /* foreground  */
- 	uint32_t bg;      /* background  */
-+	int ustyle;	  /* underline style */
-+	int ucolor[3];    /* underline color */
- } Glyph;
- 
- typedef Glyph *Line;
-@@ -77,10 +80,14 @@
- 	const char *s;
- } Arg;
- 
-+void autocomplete (const Arg *);
-+
- void die(const char *, ...);
+@@ -81,6 +83,8 @@
  void redraw(void);
  void draw(void);
  
@@ -1234,38 +1064,51 @@ diff -ruN st.orig/st.h st/st.h
  void printscreen(const Arg *);
  void printsel(const Arg *);
  void sendbreak(const Arg *);
-@@ -124,3 +131,4 @@
+@@ -111,6 +115,14 @@
+ void *xrealloc(void *, size_t);
+ char *xstrdup(const char *);
+ 
++int isboxdraw(Rune);
++ushort boxdrawindex(const Glyph *);
++#ifdef XFT_VERSION
++/* only exposed to x.c, otherwise we'll need Xft.h for the types */
++void boxdraw_xinit(Display *, Colormap, XftDraw *, Visual *);
++void drawboxes(int, int, int, int, XftColor *, XftColor *, const XftGlyphFontSpec *, int);
++#endif
++
+ /* config.h globals */
+ extern char *utmp;
+ extern char *scroll;
+@@ -124,3 +136,5 @@
  extern unsigned int defaultfg;
  extern unsigned int defaultbg;
  extern unsigned int defaultcs;
++extern const int boxdraw, boxdraw_bold, boxdraw_braille;
 +extern float alpha;
-diff -ruN st.orig/st.info st/st.info
---- st.orig/st.info	2023-05-14 14:31:17.035380023 +0200
-+++ st/st.info	2023-05-14 14:35:22.008118068 +0200
-@@ -1,4 +1,5 @@
- st-mono| simpleterm monocolor,
-+	Su,
- 	acsc=+C\,D-A.B0E``aaffgghFiGjjkkllmmnnooppqqrrssttuuvvwwxxyyzz{{||}}~~,
- 	am,
- 	bce,
-diff -ruN st.orig/x.c st/x.c
---- st.orig/x.c	2023-05-14 14:31:17.045380023 +0200
-+++ st/x.c	2023-05-14 15:28:33.849904173 +0200
-@@ -44,6 +44,13 @@
- 	signed char appkey;    /* application keypad */
- 	signed char appcursor; /* application cursor */
- } Key;
-+/* Undercurl slope types */
-+enum undercurl_slope_type {
-+	UNDERCURL_SLOPE_ASCENDING = 0,
-+	UNDERCURL_SLOPE_TOP_CAP = 1,
-+	UNDERCURL_SLOPE_DESCENDING = 2,
-+	UNDERCURL_SLOPE_BOTTOM_CAP = 3
-+};
+diff -ruN st.org/win.h st.patched/win.h
+--- st.org/win.h	2023-05-15 12:40:32.129310000 +0200
++++ st.patched/win.h	2023-05-15 13:54:00.204913000 +0200
+@@ -25,7 +25,7 @@
  
- /* X modifiers */
- #define XK_ANY_MOD    UINT_MAX
-@@ -81,6 +88,7 @@
+ void xbell(void);
+ void xclipcopy(void);
+-void xdrawcursor(int, int, Glyph, int, int, Glyph);
++void xdrawcursor(int, int, Glyph, int, int, Glyph, Line, int);
+ void xdrawline(Line, int, int, int);
+ void xfinishdraw(void);
+ void xloadcols(void);
+diff -ruN st.org/x.c st.patched/x.c
+--- st.org/x.c	2023-05-15 12:40:32.130259000 +0200
++++ st.patched/x.c	2023-05-15 13:54:00.205394000 +0200
+@@ -19,6 +19,7 @@
+ #include "arg.h"
+ #include "st.h"
+ #include "win.h"
++#include "hb.h"
+ 
+ /* types used in config.h */
+ typedef struct {
+@@ -81,6 +82,7 @@
  typedef struct {
  	int tw, th; /* tty width and height */
  	int w, h; /* window width and height */
@@ -1273,7 +1116,7 @@ diff -ruN st.orig/x.c st/x.c
  	int ch; /* char height */
  	int cw; /* char width  */
  	int mode; /* window state/mode flags */
-@@ -105,6 +113,7 @@
+@@ -105,6 +107,7 @@
  	XSetWindowAttributes attrs;
  	int scr;
  	int isfixed; /* is fixed geometry? */
@@ -1281,15 +1124,23 @@ diff -ruN st.orig/x.c st/x.c
  	int l, t; /* left and top offset */
  	int gm; /* geometry mask */
  } XWindow;
-@@ -242,6 +251,7 @@
- static char *usedfont = NULL;
+@@ -141,6 +144,7 @@
+ } DC;
+ 
+ static inline ushort sixd_to_16bit(int);
++static void xresetfontsettings(ushort mode, Font **font, int *frcflags);
+ static int xmakeglyphfontspecs(XftGlyphFontSpec *, const Glyph *, int, int, int);
+ static void xdrawglyphfontspecs(const XftGlyphFontSpec *, Glyph, int, int, int);
+ static void xdrawglyph(Glyph, int, int);
+@@ -243,6 +247,7 @@
  static double usedfontsize = 0;
  static double defaultfontsize = 0;
-+static char *opt_alpha = NULL;
  
++static char *opt_alpha = NULL;
  static char *opt_class = NULL;
  static char **opt_cmd  = NULL;
-@@ -253,6 +263,7 @@
+ static char *opt_embed = NULL;
+@@ -253,6 +258,7 @@
  static char *opt_title = NULL;
  
  static uint buttons; /* bit field of pressed buttons */
@@ -1297,7 +1148,7 @@ diff -ruN st.orig/x.c st/x.c
  
  void
  clipcopy(const Arg *dummy)
-@@ -331,7 +342,7 @@
+@@ -331,7 +337,7 @@
  int
  evcol(XEvent *e)
  {
@@ -1306,7 +1157,7 @@ diff -ruN st.orig/x.c st/x.c
  	LIMIT(x, 0, win.tw - 1);
  	return x / win.cw;
  }
-@@ -339,7 +350,7 @@
+@@ -339,7 +345,7 @@
  int
  evrow(XEvent *e)
  {
@@ -1315,16 +1166,17 @@ diff -ruN st.orig/x.c st/x.c
  	LIMIT(y, 0, win.th - 1);
  	return y / win.ch;
  }
-@@ -738,6 +749,8 @@
- 	row = (win.h - 2 * borderpx) / win.ch;
+@@ -739,6 +745,9 @@
  	col = MAX(1, col);
  	row = MAX(1, row);
+ 
 +	win.hborderpx = (win.w - col * win.cw) / 2;
 +	win.vborderpx = (win.h - row * win.ch) / 2;
- 
++
  	tresize(col, row);
  	xresize(col, row);
-@@ -752,7 +765,7 @@
+ 	ttyresize(win.tw, win.th);
+@@ -752,12 +761,12 @@
  
  	XFreePixmap(xw.dpy, xw.buf);
  	xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h,
@@ -1333,22 +1185,27 @@ diff -ruN st.orig/x.c st/x.c
  	XftDrawChange(xw.draw, xw.buf);
  	xclear(0, 0, win.w, win.h);
  
-@@ -812,7 +825,13 @@
+ 	/* resize to new width */
+-	xw.specbuf = xrealloc(xw.specbuf, col * sizeof(GlyphFontSpec));
++	xw.specbuf = xrealloc(xw.specbuf, col * sizeof(GlyphFontSpec) * 4);
+ }
+ 
+ ushort
+@@ -812,6 +821,13 @@
  			else
  				die("could not allocate color %d\n", i);
  		}
--	loaded = 1;
++
 +	/* set alpha value of bg color */
 +	if (opt_alpha)
 +		alpha = strtof(opt_alpha, NULL);
 +	dc.col[defaultbg].color.alpha = (unsigned short)(0xffff * alpha);
 +	dc.col[defaultbg].pixel &= 0x00FFFFFF;
 +	dc.col[defaultbg].pixel |= (unsigned char)(0xff * alpha) << 24;
-+ 	loaded = 1;
+ 	loaded = 1;
  }
  
- int
-@@ -869,8 +888,8 @@
+@@ -869,8 +885,8 @@
  	sizeh->flags = PSize | PResizeInc | PBaseSize | PMinSize;
  	sizeh->height = win.h;
  	sizeh->width = win.w;
@@ -1359,7 +1216,17 @@ diff -ruN st.orig/x.c st/x.c
  	sizeh->base_height = 2 * borderpx;
  	sizeh->base_width = 2 * borderpx;
  	sizeh->min_height = win.ch + 2 * borderpx;
-@@ -1134,11 +1153,23 @@
+@@ -1062,6 +1078,9 @@
+ void
+ xunloadfonts(void)
+ {
++	/* Clear Harfbuzz font cache. */
++	hbunloadfonts();
++
+ 	/* Free the loaded fonts in the font cache.  */
+ 	while (frclen > 0)
+ 		XftFontClose(xw.dpy, frc[--frclen].font);
+@@ -1134,12 +1153,24 @@
  	Window parent;
  	pid_t thispid = getpid();
  	XColor xmousefg, xmousebg;
@@ -1370,7 +1237,7 @@ diff -ruN st.orig/x.c st/x.c
  		die("can't open display\n");
  	xw.scr = XDefaultScreen(xw.dpy);
 -	xw.vis = XDefaultVisual(xw.dpy, xw.scr);
-+	
+ 
 +	if (!(opt_embed && (parent = strtol(opt_embed, NULL, 0)))) {
 +		parent = XRootWindow(xw.dpy, xw.scr);
 +		xw.depth = 32;
@@ -1381,9 +1248,10 @@ diff -ruN st.orig/x.c st/x.c
 +
 +	XMatchVisualInfo(xw.dpy, xw.scr, xw.depth, TrueColor, &vis);
 +	xw.vis = vis.visual;
- 
++
  	/* font */
  	if (!FcInit())
+ 		die("could not init fontconfig.\n");
 @@ -1148,12 +1179,12 @@
  	xloadfonts(usedfont, 0);
  
@@ -1400,7 +1268,7 @@ diff -ruN st.orig/x.c st/x.c
  	if (xw.gm & XNegative)
  		xw.l += DisplayWidth(xw.dpy, xw.scr) - win.w - 2;
  	if (xw.gm & YNegative)
-@@ -1168,19 +1199,15 @@
+@@ -1168,24 +1199,20 @@
  		| ButtonMotionMask | ButtonPressMask | ButtonReleaseMask;
  	xw.attrs.colormap = xw.cmap;
  
@@ -1423,7 +1291,36 @@ diff -ruN st.orig/x.c st/x.c
  	XSetForeground(xw.dpy, dc.gc, dc.col[defaultbg].pixel);
  	XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, win.w, win.h);
  
-@@ -1242,7 +1269,7 @@
+ 	/* font spec buffer */
+-	xw.specbuf = xmalloc(cols * sizeof(GlyphFontSpec));
++	xw.specbuf = xmalloc(cols * sizeof(GlyphFontSpec) * 4);
+ 
+ 	/* Xft rendering context */
+ 	xw.draw = XftDrawCreate(xw.dpy, xw.buf, xw.vis, xw.cmap);
+@@ -1237,12 +1264,30 @@
+ 	xsel.xtarget = XInternAtom(xw.dpy, "UTF8_STRING", 0);
+ 	if (xsel.xtarget == None)
+ 		xsel.xtarget = XA_STRING;
++
++	boxdraw_xinit(xw.dpy, xw.cmap, xw.draw, xw.vis);
+ }
+ 
++void
++xresetfontsettings(ushort mode, Font **font, int *frcflags)
++{
++	*font = &dc.font;
++	if ((mode & ATTR_ITALIC) && (mode & ATTR_BOLD)) {
++		*font = &dc.ibfont;
++		*frcflags = FRC_ITALICBOLD;
++	} else if (mode & ATTR_ITALIC) {
++		*font = &dc.ifont;
++		*frcflags = FRC_ITALIC;
++	} else if (mode & ATTR_BOLD) {
++		*font = &dc.bfont;
++		*frcflags = FRC_BOLD;
++	}
++}
++
  int
  xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x, int y)
  {
@@ -1432,56 +1329,258 @@ diff -ruN st.orig/x.c st/x.c
  	ushort mode, prevmode = USHRT_MAX;
  	Font *font = &dc.font;
  	int frcflags = FRC_NORMAL;
-@@ -1371,11 +1398,56 @@
+@@ -1253,121 +1298,158 @@
+ 	FcPattern *fcpattern, *fontpattern;
+ 	FcFontSet *fcsets[] = { NULL };
+ 	FcCharSet *fccharset;
+-	int i, f, numspecs = 0;
++	int i, f, length = 0, start = 0, numspecs = 0;
++	float cluster_xp = xp, cluster_yp = yp;
++	HbTransformData shaped = { 0 };
+ 
++	/* Initial values. */
++	mode = prevmode = glyphs[0].mode;
++	xresetfontsettings(mode, &font, &frcflags);
++
+ 	for (i = 0, xp = winx, yp = winy + font->ascent; i < len; ++i) {
+-		/* Fetch rune and mode for current glyph. */
+-		rune = glyphs[i].u;
+ 		mode = glyphs[i].mode;
+ 
+ 		/* Skip dummy wide-character spacing. */
+-		if (mode == ATTR_WDUMMY)
++		if (mode & ATTR_WDUMMY && i < (len - 1))
+ 			continue;
+ 
+-		/* Determine font for glyph if different from previous glyph. */
+-		if (prevmode != mode) {
+-			prevmode = mode;
+-			font = &dc.font;
+-			frcflags = FRC_NORMAL;
+-			runewidth = win.cw * ((mode & ATTR_WIDE) ? 2.0f : 1.0f);
+-			if ((mode & ATTR_ITALIC) && (mode & ATTR_BOLD)) {
+-				font = &dc.ibfont;
+-				frcflags = FRC_ITALICBOLD;
+-			} else if (mode & ATTR_ITALIC) {
+-				font = &dc.ifont;
+-				frcflags = FRC_ITALIC;
+-			} else if (mode & ATTR_BOLD) {
+-				font = &dc.bfont;
+-				frcflags = FRC_BOLD;
++		if (
++			prevmode != mode
++			|| ATTRCMP(glyphs[start], glyphs[i])
++			|| selected(x + i, y) != selected(x + start, y)
++			|| i == (len - 1)
++		) {
++			/* Handle 1-character wide segments and end of line */
++			length = i - start;
++			if (i == start) {
++				length = 1;
++			} else if (i == (len - 1)) {
++				length = (i - start + 1);
+ 			}
+-			yp = winy + font->ascent;
+-		}
+ 
+-		/* Lookup character index with default font. */
+-		glyphidx = XftCharIndex(xw.dpy, font->match, rune);
+-		if (glyphidx) {
+-			specs[numspecs].font = font->match;
+-			specs[numspecs].glyph = glyphidx;
+-			specs[numspecs].x = (short)xp;
+-			specs[numspecs].y = (short)yp;
+-			xp += runewidth;
+-			numspecs++;
+-			continue;
+-		}
++			/* Shape the segment. */
++			hbtransform(&shaped, font->match, glyphs, start, length);
++			runewidth = win.cw * ((glyphs[start].mode & ATTR_WIDE) ? 2.0f : 1.0f);
++			cluster_xp = xp; cluster_yp = yp;
++			for (int code_idx = 0; code_idx < shaped.count; code_idx++) {
++				int idx = shaped.glyphs[code_idx].cluster;
+ 
+-		/* Fallback on font cache, search the font cache for match. */
+-		for (f = 0; f < frclen; f++) {
+-			glyphidx = XftCharIndex(xw.dpy, frc[f].font, rune);
+-			/* Everything correct. */
+-			if (glyphidx && frc[f].flags == frcflags)
+-				break;
+-			/* We got a default font for a not found glyph. */
+-			if (!glyphidx && frc[f].flags == frcflags
+-					&& frc[f].unicodep == rune) {
+-				break;
+-			}
+-		}
++				if (glyphs[start + idx].mode & ATTR_WDUMMY)
++					continue;
+ 
+-		/* Nothing was found. Use fontconfig to find matching font. */
+-		if (f >= frclen) {
+-			if (!font->set)
+-				font->set = FcFontSort(0, font->pattern,
+-				                       1, 0, &fcres);
+-			fcsets[0] = font->set;
++				/* Advance the drawing cursor if we've moved to a new cluster */
++				if (code_idx > 0 && idx != shaped.glyphs[code_idx - 1].cluster) {
++					xp += runewidth;
++					cluster_xp = xp;
++					cluster_yp = yp;
++					runewidth = win.cw * ((glyphs[start + idx].mode & ATTR_WIDE) ? 2.0f : 1.0f);
++				}
+ 
+-			/*
+-			 * Nothing was found in the cache. Now use
+-			 * some dozen of Fontconfig calls to get the
+-			 * font for one single character.
+-			 *
+-			 * Xft and fontconfig are design failures.
+-			 */
+-			fcpattern = FcPatternDuplicate(font->pattern);
+-			fccharset = FcCharSetCreate();
++				if (glyphs[start + code_idx].mode & ATTR_BOXDRAW) {
++					/* minor shoehorning: boxdraw uses only this ushort */
++					specs[numspecs].font = font->match;
++					specs[numspecs].glyph = boxdrawindex(&glyphs[start + code_idx]);
++					specs[numspecs].x = xp;
++					specs[numspecs].y = yp;
++					numspecs++;
++				} else if (shaped.glyphs[code_idx].codepoint != 0) {
++					/* If symbol is found, put it into the specs. */
++					specs[numspecs].font = font->match;
++					specs[numspecs].glyph = shaped.glyphs[code_idx].codepoint;
++					specs[numspecs].x = cluster_xp + (short)(shaped.positions[code_idx].x_offset / 64.);
++					specs[numspecs].y = cluster_yp - (short)(shaped.positions[code_idx].y_offset / 64.);
++					cluster_xp += shaped.positions[code_idx].x_advance / 64.;
++					cluster_yp += shaped.positions[code_idx].y_advance / 64.;
++					numspecs++;
++				} else {
++					/* If it's not found, try to fetch it through the font cache. */
++					rune = glyphs[start + idx].u;
++					for (f = 0; f < frclen; f++) {
++						glyphidx = XftCharIndex(xw.dpy, frc[f].font, rune);
++						/* Everything correct. */
++						if (glyphidx && frc[f].flags == frcflags)
++							break;
++						/* We got a default font for a not found glyph. */
++						if (!glyphidx && frc[f].flags == frcflags
++								&& frc[f].unicodep == rune) {
++							break;
++						}
++					}
+ 
+-			FcCharSetAddChar(fccharset, rune);
+-			FcPatternAddCharSet(fcpattern, FC_CHARSET,
+-					fccharset);
+-			FcPatternAddBool(fcpattern, FC_SCALABLE, 1);
++					/* Nothing was found. Use fontconfig to find matching font. */
++					if (f >= frclen) {
++						if (!font->set)
++							font->set = FcFontSort(0, font->pattern,
++																		 1, 0, &fcres);
++						fcsets[0] = font->set;
+ 
+-			FcConfigSubstitute(0, fcpattern,
+-					FcMatchPattern);
+-			FcDefaultSubstitute(fcpattern);
++						/*
++						 * Nothing was found in the cache. Now use
++						 * some dozen of Fontconfig calls to get the
++						 * font for one single character.
++						 *
++						 * Xft and fontconfig are design failures.
++						 */
++						fcpattern = FcPatternDuplicate(font->pattern);
++						fccharset = FcCharSetCreate();
+ 
+-			fontpattern = FcFontSetMatch(0, fcsets, 1,
+-					fcpattern, &fcres);
++						FcCharSetAddChar(fccharset, rune);
++						FcPatternAddCharSet(fcpattern, FC_CHARSET,
++								fccharset);
++						FcPatternAddBool(fcpattern, FC_SCALABLE, 1);
+ 
+-			/* Allocate memory for the new cache entry. */
+-			if (frclen >= frccap) {
+-				frccap += 16;
+-				frc = xrealloc(frc, frccap * sizeof(Fontcache));
+-			}
++						FcConfigSubstitute(0, fcpattern,
++								FcMatchPattern);
++						FcDefaultSubstitute(fcpattern);
+ 
+-			frc[frclen].font = XftFontOpenPattern(xw.dpy,
+-					fontpattern);
+-			if (!frc[frclen].font)
+-				die("XftFontOpenPattern failed seeking fallback font: %s\n",
+-					strerror(errno));
+-			frc[frclen].flags = frcflags;
+-			frc[frclen].unicodep = rune;
++						fontpattern = FcFontSetMatch(0, fcsets, 1,
++								fcpattern, &fcres);
+ 
+-			glyphidx = XftCharIndex(xw.dpy, frc[frclen].font, rune);
++						/* Allocate memory for the new cache entry. */
++						if (frclen >= frccap) {
++							frccap += 16;
++							frc = xrealloc(frc, frccap * sizeof(Fontcache));
++						}
+ 
+-			f = frclen;
+-			frclen++;
++						frc[frclen].font = XftFontOpenPattern(xw.dpy,
++								fontpattern);
++						if (!frc[frclen].font)
++							die("XftFontOpenPattern failed seeking fallback font: %s\n",
++								strerror(errno));
++						frc[frclen].flags = frcflags;
++						frc[frclen].unicodep = rune;
+ 
+-			FcPatternDestroy(fcpattern);
+-			FcCharSetDestroy(fccharset);
+-		}
++						glyphidx = XftCharIndex(xw.dpy, frc[frclen].font, rune);
+ 
+-		specs[numspecs].font = frc[f].font;
+-		specs[numspecs].glyph = glyphidx;
+-		specs[numspecs].x = (short)xp;
+-		specs[numspecs].y = (short)yp;
+-		xp += runewidth;
+-		numspecs++;
++						f = frclen;
++						frclen++;
++
++						FcPatternDestroy(fcpattern);
++						FcCharSetDestroy(fccharset);
++					}
++
++					specs[numspecs].font = frc[f].font;
++					specs[numspecs].glyph = glyphidx;
++					specs[numspecs].x = (short)xp;
++					specs[numspecs].y = (short)yp;
++					numspecs++;
++				}
++			}
++
++			/* Cleanup and get ready for next segment. */
++			hbcleanup(&shaped);
++			start = i;
++
++			/* Determine font for glyph if different from previous glyph. */
++			if (prevmode != mode) {
++				prevmode = mode;
++				xresetfontsettings(mode, &font, &frcflags);
++				yp = winy + font->ascent;
++			}
++		}
+ 	}
+ 
++	hbcleanup(&shaped);
  	return numspecs;
  }
  
-+static int isSlopeRising (int x, int iPoint, int waveWidth)
-+{
-+	//    .     .     .     .
-+	//   / \   / \   / \   / \
-+	//  /   \ /   \ /   \ /   \
-+	// .     .     .     .     .
-+
-+	// Find absolute `x` of point
-+	x += iPoint * (waveWidth/2);
-+
-+	// Find index of absolute wave
-+	int absSlope = x / ((float)waveWidth/2);
-+
-+	return (absSlope % 2);
-+}
-+
-+static int getSlope (int x, int iPoint, int waveWidth)
-+{
-+	// Sizes: Caps are half width of slopes
-+	//    1_2       1_2       1_2      1_2
-+	//   /   \     /   \     /   \    /   \
-+	//  /     \   /     \   /     \  /     \
-+	// 0       3_0       3_0      3_0       3_
-+	// <2->    <1>         <---6---->
-+
-+	// Find type of first point
-+	int firstType;
-+	x -= (x / waveWidth) * waveWidth;
-+	if (x < (waveWidth * (2.f/6.f)))
-+		firstType = UNDERCURL_SLOPE_ASCENDING;
-+	else if (x < (waveWidth * (3.f/6.f)))
-+		firstType = UNDERCURL_SLOPE_TOP_CAP;
-+	else if (x < (waveWidth * (5.f/6.f)))
-+		firstType = UNDERCURL_SLOPE_DESCENDING;
-+	else
-+		firstType = UNDERCURL_SLOPE_BOTTOM_CAP;
-+
-+	// Find type of given point
-+	int pointType = (iPoint % 4);
-+	pointType += firstType;
-+	pointType %= 4;
-+
-+	return pointType;
-+}
-+
- void
+@@ -1375,7 +1457,7 @@
  xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, int y)
  {
  	int charlen = len * ((base.mode & ATTR_WIDE) ? 2 : 1);
@@ -1490,7 +1589,7 @@ diff -ruN st.orig/x.c st/x.c
  	    width = charlen * win.cw;
  	Color *fg, *bg, *temp, revfg, revbg, truefg, truebg;
  	XRenderColor colfg, colbg;
-@@ -1465,17 +1537,17 @@
+@@ -1465,17 +1547,17 @@
  
  	/* Intelligent cleaning up of the borders. */
  	if (x == 0) {
@@ -1514,367 +1613,51 @@ diff -ruN st.orig/x.c st/x.c
  		xclear(winx, winy + win.ch, winx + width, win.h);
  
  	/* Clean up the region we want to draw to. */
-@@ -1493,8 +1565,357 @@
+@@ -1488,8 +1570,12 @@
+ 	r.width = width;
+ 	XftDrawSetClipRectangles(xw.draw, winx, winy, &r, 1);
+ 
+-	/* Render the glyphs. */
+-	XftDrawGlyphFontSpec(xw.draw, fg, specs, len);
++	if (base.mode & ATTR_BOXDRAW) {
++		drawboxes(winx, winy, width / len, win.ch, fg, bg, specs, len);
++	} else {
++		/* Render the glyphs. */
++		XftDrawGlyphFontSpec(xw.draw, fg, specs, len);
++	}
  
  	/* Render underline and strikethrough. */
  	if (base.mode & ATTR_UNDERLINE) {
--		XftDrawRect(xw.draw, fg, winx, winy + dc.font.ascent * chscale + 1,
--				width, 1);
-+		// Underline Color
-+		const int widthThreshold  = 28; // +1 width every widthThreshold px of font
-+		int wlw = (win.ch / widthThreshold) + 1; // Wave Line Width
-+		int linecolor;
-+		if ((base.ucolor[0] >= 0) &&
-+			!(base.mode & ATTR_BLINK && win.mode & MODE_BLINK) &&
-+			!(base.mode & ATTR_INVISIBLE)
-+		) {
-+			// Special color for underline
-+			// Index
-+			if (base.ucolor[1] < 0) {
-+				linecolor = dc.col[base.ucolor[0]].pixel;
-+			}
-+			// RGB
-+			else {
-+				XColor lcolor;
-+				lcolor.red = base.ucolor[0] * 257;
-+				lcolor.green = base.ucolor[1] * 257;
-+				lcolor.blue = base.ucolor[2] * 257;
-+				lcolor.flags = DoRed | DoGreen | DoBlue;
-+				XAllocColor(xw.dpy, xw.cmap, &lcolor);
-+				linecolor = lcolor.pixel;
-+			}
-+		} else {
-+			// Foreground color for underline
-+			linecolor = fg->pixel;
-+		}
-+
-+		XGCValues ugcv = {
-+			.foreground = linecolor,
-+			.line_width = wlw,
-+			.line_style = LineSolid,
-+			.cap_style = CapNotLast
-+		};
-+
-+		GC ugc = XCreateGC(xw.dpy, XftDrawDrawable(xw.draw),
-+			GCForeground | GCLineWidth | GCLineStyle | GCCapStyle,
-+			&ugcv);
-+
-+		// Underline Style
-+		if (base.ustyle != 3) {
-+			//XftDrawRect(xw.draw, fg, winx, winy + dc.font.ascent + 1, width, 1);
-+			XFillRectangle(xw.dpy, XftDrawDrawable(xw.draw), ugc, winx,
-+				winy + dc.font.ascent + 1, width, wlw);
-+		} else if (base.ustyle == 3) {
-+			int ww = win.cw;//width;
-+			int wh = dc.font.descent - wlw/2 - 1;//r.height/7;
-+			int wx = winx;
-+			int wy = winy + win.ch - dc.font.descent;
-+
-+#if UNDERCURL_STYLE == UNDERCURL_CURLY
-+			// Draw waves
-+			int narcs = charlen * 2 + 1;
-+			XArc *arcs = xmalloc(sizeof(XArc) * narcs);
-+
-+			int i = 0;
-+			for (i = 0; i < charlen-1; i++) {
-+				arcs[i*2] = (XArc) {
-+					.x = wx + win.cw * i + ww / 4,
-+					.y = wy,
-+					.width = win.cw / 2,
-+					.height = wh,
-+					.angle1 = 0,
-+					.angle2 = 180 * 64
-+				};
-+				arcs[i*2+1] = (XArc) {
-+					.x = wx + win.cw * i + ww * 0.75,
-+					.y = wy,
-+					.width = win.cw/2,
-+					.height = wh,
-+					.angle1 = 180 * 64,
-+					.angle2 = 180 * 64
-+				};
-+			}
-+			// Last wave
-+			arcs[i*2] = (XArc) {wx + ww * i + ww / 4, wy, ww / 2, wh,
-+			0, 180 * 64 };
-+			// Last wave tail
-+			arcs[i*2+1] = (XArc) {wx + ww * i + ww * 0.75, wy, ceil(ww / 2.),
-+			wh, 180 * 64, 90 * 64};
-+			// First wave tail
-+			i++;
-+			arcs[i*2] = (XArc) {wx - ww/4 - 1, wy, ceil(ww / 2.), wh, 270 * 64,
-+			90 * 64 };
-+
-+			XDrawArcs(xw.dpy, XftDrawDrawable(xw.draw), ugc, arcs, narcs);
-+
-+			free(arcs);
-+#elif UNDERCURL_STYLE == UNDERCURL_SPIKY
-+			// Make the underline corridor larger
-+			/*
-+			wy -= wh;
-+			*/
-+			wh *= 2;
-+
-+			// Set the angle of the slope to 45°
-+			ww = wh;
-+
-+			// Position of wave is independent of word, it's absolute
-+			wx = (wx / (ww/2)) * (ww/2);
-+
-+			int marginStart = winx - wx;
-+
-+			// Calculate number of points with floating precision
-+			float n = width;					// Width of word in pixels
-+			n = (n / ww) * 2;					// Number of slopes (/ or \)
-+			n += 2;								// Add two last points
-+			int npoints = n;					// Convert to int
-+
-+			// Total length of underline
-+			float waveLength = 0;
-+
-+			if (npoints >= 3) {
-+				// We add an aditional slot in case we use a bonus point
-+				XPoint *points = xmalloc(sizeof(XPoint) * (npoints + 1));
-+
-+				// First point (Starts with the word bounds)
-+				points[0] = (XPoint) {
-+					.x = wx + marginStart,
-+					.y = (isSlopeRising(wx, 0, ww))
-+						? (wy - marginStart + ww/2.f)
-+						: (wy + marginStart)
-+				};
-+
-+				// Second point (Goes back to the absolute point coordinates)
-+				points[1] = (XPoint) {
-+					.x = (ww/2.f) - marginStart,
-+					.y = (isSlopeRising(wx, 1, ww))
-+						? (ww/2.f - marginStart)
-+						: (-ww/2.f + marginStart)
-+				};
-+				waveLength += (ww/2.f) - marginStart;
-+
-+				// The rest of the points
-+				for (int i = 2; i < npoints-1; i++) {
-+					points[i] = (XPoint) {
-+						.x = ww/2,
-+						.y = (isSlopeRising(wx, i, ww))
-+							? wh/2
-+							: -wh/2
-+					};
-+					waveLength += ww/2;
-+				}
-+
-+				// Last point
-+				points[npoints-1] = (XPoint) {
-+					.x = ww/2,
-+					.y = (isSlopeRising(wx, npoints-1, ww))
-+						? wh/2
-+						: -wh/2
-+				};
-+				waveLength += ww/2;
-+
-+				// End
-+				if (waveLength < width) { // Add a bonus point?
-+					int marginEnd = width - waveLength;
-+					points[npoints] = (XPoint) {
-+						.x = marginEnd,
-+						.y = (isSlopeRising(wx, npoints, ww))
-+							? (marginEnd)
-+							: (-marginEnd)
-+					};
-+
-+					npoints++;
-+				} else if (waveLength > width) { // Is last point too far?
-+					int marginEnd = waveLength - width;
-+					points[npoints-1].x -= marginEnd;
-+					if (isSlopeRising(wx, npoints-1, ww))
-+						points[npoints-1].y -= (marginEnd);
-+					else
-+						points[npoints-1].y += (marginEnd);
-+				}
-+
-+				// Draw the lines
-+				XDrawLines(xw.dpy, XftDrawDrawable(xw.draw), ugc, points, npoints,
-+						CoordModePrevious);
-+
-+				// Draw a second underline with an offset of 1 pixel
-+				if ( ((win.ch / (widthThreshold/2)) % 2)) {
-+					points[0].x++;
-+
-+					XDrawLines(xw.dpy, XftDrawDrawable(xw.draw), ugc, points,
-+							npoints, CoordModePrevious);
-+				}
-+
-+				// Free resources
-+				free(points);
-+			}
-+#else // UNDERCURL_CAPPED
-+			// Cap is half of wave width
-+			float capRatio = 0.5f;
-+
-+			// Make the underline corridor larger
-+			wh *= 2;
-+
-+			// Set the angle of the slope to 45°
-+			ww = wh;
-+			ww *= 1 + capRatio; // Add a bit of width for the cap
-+
-+			// Position of wave is independent of word, it's absolute
-+			wx = (wx / ww) * ww;
-+
-+			float marginStart;
-+			switch(getSlope(winx, 0, ww)) {
-+				case UNDERCURL_SLOPE_ASCENDING:
-+					marginStart = winx - wx;
-+					break;
-+				case UNDERCURL_SLOPE_TOP_CAP:
-+					marginStart = winx - (wx + (ww * (2.f/6.f)));
-+					break;
-+				case UNDERCURL_SLOPE_DESCENDING:
-+					marginStart = winx - (wx + (ww * (3.f/6.f)));
-+					break;
-+				case UNDERCURL_SLOPE_BOTTOM_CAP:
-+					marginStart = winx - (wx + (ww * (5.f/6.f)));
-+					break;
-+			}
-+
-+			// Calculate number of points with floating precision
-+			float n = width;					// Width of word in pixels
-+												//					   ._.
-+			n = (n / ww) * 4;					// Number of points (./   \.)
-+			n += 2;								// Add two last points
-+			int npoints = n;					// Convert to int
-+
-+			// Position of the pen to draw the lines
-+			float penX = 0;
-+			float penY = 0;
-+
-+			if (npoints >= 3) {
-+				XPoint *points = xmalloc(sizeof(XPoint) * (npoints + 1));
-+
-+				// First point (Starts with the word bounds)
-+				penX = winx;
-+				switch (getSlope(winx, 0, ww)) {
-+					case UNDERCURL_SLOPE_ASCENDING:
-+						penY = wy + wh/2.f - marginStart;
-+						break;
-+					case UNDERCURL_SLOPE_TOP_CAP:
-+						penY = wy;
-+						break;
-+					case UNDERCURL_SLOPE_DESCENDING:
-+						penY = wy + marginStart;
-+						break;
-+					case UNDERCURL_SLOPE_BOTTOM_CAP:
-+						penY = wy + wh/2.f;
-+						break;
-+				}
-+				points[0].x = penX;
-+				points[0].y = penY;
-+
-+				// Second point (Goes back to the absolute point coordinates)
-+				switch (getSlope(winx, 1, ww)) {
-+					case UNDERCURL_SLOPE_ASCENDING:
-+						penX += ww * (1.f/6.f) - marginStart;
-+						penY += 0;
-+						break;
-+					case UNDERCURL_SLOPE_TOP_CAP:
-+						penX += ww * (2.f/6.f) - marginStart;
-+						penY += -wh/2.f + marginStart;
-+						break;
-+					case UNDERCURL_SLOPE_DESCENDING:
-+						penX += ww * (1.f/6.f) - marginStart;
-+						penY += 0;
-+						break;
-+					case UNDERCURL_SLOPE_BOTTOM_CAP:
-+						penX += ww * (2.f/6.f) - marginStart;
-+						penY += -marginStart + wh/2.f;
-+						break;
-+				}
-+				points[1].x = penX;
-+				points[1].y = penY;
-+
-+				// The rest of the points
-+				for (int i = 2; i < npoints; i++) {
-+					switch (getSlope(winx, i, ww)) {
-+						case UNDERCURL_SLOPE_ASCENDING:
-+						case UNDERCURL_SLOPE_DESCENDING:
-+							penX += ww * (1.f/6.f);
-+							penY += 0;
-+							break;
-+						case UNDERCURL_SLOPE_TOP_CAP:
-+							penX += ww * (2.f/6.f);
-+							penY += -wh / 2.f;
-+							break;
-+						case UNDERCURL_SLOPE_BOTTOM_CAP:
-+							penX += ww * (2.f/6.f);
-+							penY += wh / 2.f;
-+							break;
-+					}
-+					points[i].x = penX;
-+					points[i].y = penY;
-+				}
-+
-+				// End
-+				float waveLength = penX - winx;
-+				if (waveLength < width) { // Add a bonus point?
-+					int marginEnd = width - waveLength;
-+					penX += marginEnd;
-+					switch(getSlope(winx, npoints, ww)) {
-+						case UNDERCURL_SLOPE_ASCENDING:
-+						case UNDERCURL_SLOPE_DESCENDING:
-+							//penY += 0;
-+							break;
-+						case UNDERCURL_SLOPE_TOP_CAP:
-+							penY += -marginEnd;
-+							break;
-+						case UNDERCURL_SLOPE_BOTTOM_CAP:
-+							penY += marginEnd;
-+							break;
-+					}
-+
-+					points[npoints].x = penX;
-+					points[npoints].y = penY;
-+
-+					npoints++;
-+				} else if (waveLength > width) { // Is last point too far?
-+					int marginEnd = waveLength - width;
-+					points[npoints-1].x -= marginEnd;
-+					switch(getSlope(winx, npoints-1, ww)) {
-+						case UNDERCURL_SLOPE_TOP_CAP:
-+							points[npoints-1].y += marginEnd;
-+							break;
-+						case UNDERCURL_SLOPE_BOTTOM_CAP:
-+							points[npoints-1].y -= marginEnd;
-+							break;
-+						default:
-+							break;
-+					}
-+				}
-+
-+				// Draw the lines
-+				XDrawLines(xw.dpy, XftDrawDrawable(xw.draw), ugc, points, npoints,
-+						CoordModeOrigin);
-+
-+				// Draw a second underline with an offset of 1 pixel
-+				if ( ((win.ch / (widthThreshold/2)) % 2)) {
-+					for (int i = 0; i < npoints; i++)
-+						points[i].x++;
-+
-+					XDrawLines(xw.dpy, XftDrawDrawable(xw.draw), ugc, points,
-+							npoints, CoordModeOrigin);
-+				}
-+
-+				// Free resources
-+				free(points);
-+			}
-+#endif
-+		}
-+
-+		XFreeGC(xw.dpy, ugc);
- 	}
+@@ -1517,22 +1603,25 @@
+ }
  
- 	if (base.mode & ATTR_STRUCK) {
-@@ -1558,46 +1979,61 @@
+ void
+-xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og)
++xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og, Line line, int len)
+ {
+ 	Color drawcol;
+ 
+ 	/* remove the old cursor */
+ 	if (selected(ox, oy))
+ 		og.mode ^= ATTR_REVERSE;
+-	xdrawglyph(og, ox, oy);
+ 
++	/* Redraw the line where cursor was previously.
++	 * It will restore the ligatures broken by the cursor. */
++	xdrawline(line, 0, oy, len);
++
+ 	if (IS_SET(MODE_HIDE))
+ 		return;
+ 
+ 	/*
+ 	 * Select the right color for the right mode.
+ 	 */
+-	g.mode &= ATTR_BOLD|ATTR_ITALIC|ATTR_UNDERLINE|ATTR_STRUCK|ATTR_WIDE;
++	g.mode &= ATTR_BOLD|ATTR_ITALIC|ATTR_UNDERLINE|ATTR_STRUCK|ATTR_WIDE|ATTR_BOXDRAW;
+ 
+ 	if (IS_SET(MODE_REVERSE)) {
+ 		g.mode |= ATTR_REVERSE;
+@@ -1558,46 +1647,56 @@
  	/* draw the new one */
  	if (IS_SET(MODE_FOCUSED)) {
  		switch (win.cursor) {
@@ -1891,13 +1674,10 @@ diff -ruN st.orig/x.c st/x.c
  		case 2: /* Steady Block */
  			xdrawglyph(g, cx, cy);
  			break;
--		case 3: /* Blinking Underline */
--		case 4: /* Steady Underline */
-+		case 3: /* blinking underline */
+ 		case 3: /* Blinking Underline */
 +			if (IS_SET(MODE_BLINK))
 +				break;
-+			/* FALLTHROUGH */
-+		case 4: /* steady underline */
+ 		case 4: /* Steady Underline */
  			XftDrawRect(xw.draw, &drawcol,
 -					borderpx + cx * win.cw,
 -					borderpx + (cy + 1) * win.ch - \
@@ -1906,13 +1686,8 @@ diff -ruN st.orig/x.c st/x.c
  						cursorthickness,
  					win.cw, cursorthickness);
  			break;
--		case 5: /* Blinking bar */
--		case 6: /* Steady bar */
-+		case 5: /* blinking bar */
-+			if (IS_SET(MODE_BLINK))
-+				break;
-+			/* FALLTHROUGH */
-+		case 6: /* steady bar */
+ 		case 5: /* Blinking bar */
+ 		case 6: /* Steady bar */
  			XftDrawRect(xw.draw, &drawcol,
 -					borderpx + cx * win.cw,
 -					borderpx + cy * win.ch,
@@ -1923,7 +1698,6 @@ diff -ruN st.orig/x.c st/x.c
 +		case 7: /* blinking st cursor */
 +			if (IS_SET(MODE_BLINK))
 +				break;
-+			/* FALLTHROUGH */
 +		case 8: /* steady st cursor */
 +			g.u = stcursor;
 +			xdrawglyph(g, cx, cy);
@@ -1956,7 +1730,43 @@ diff -ruN st.orig/x.c st/x.c
  				win.cw, 1);
  	}
  }
-@@ -1737,9 +2173,13 @@
+@@ -1652,18 +1751,16 @@
+ 	Glyph base, new;
+ 	XftGlyphFontSpec *specs = xw.specbuf;
+ 
+-	numspecs = xmakeglyphfontspecs(specs, &line[x1], x2 - x1, x1, y1);
+ 	i = ox = 0;
+-	for (x = x1; x < x2 && i < numspecs; x++) {
++	for (x = x1; x < x2; x++) {
+ 		new = line[x];
+ 		if (new.mode == ATTR_WDUMMY)
+ 			continue;
+ 		if (selected(x, y1))
+ 			new.mode ^= ATTR_REVERSE;
+-		if (i > 0 && ATTRCMP(base, new)) {
+-			xdrawglyphfontspecs(specs, base, i, ox, y1);
+-			specs += i;
+-			numspecs -= i;
++		if ((i > 0) && ATTRCMP(base, new)) {
++			numspecs = xmakeglyphfontspecs(specs, &line[ox], x - ox, ox, y1);
++			xdrawglyphfontspecs(specs, base, numspecs, ox, y1);
+ 			i = 0;
+ 		}
+ 		if (i == 0) {
+@@ -1672,8 +1769,10 @@
+ 		}
+ 		i++;
+ 	}
+-	if (i > 0)
+-		xdrawglyphfontspecs(specs, base, i, ox, y1);
++	if (i > 0) {
++		numspecs = xmakeglyphfontspecs(specs, &line[ox], x2 - ox, ox, y1);
++		xdrawglyphfontspecs(specs, base, numspecs, ox, y1);
++	}
+ }
+ 
+ void
+@@ -1737,9 +1836,12 @@
  int
  xsetcursor(int cursor)
  {
@@ -1966,33 +1776,11 @@ diff -ruN st.orig/x.c st/x.c
  	win.cursor = cursor;
 +	cursorblinks = win.cursor == 0 || win.cursor == 1 ||
 +	               win.cursor == 3 || win.cursor == 5 ||
-+				   win.cursor == 7;
-+				   
++	               win.cursor == 7;
  	return 0;
  }
  
-@@ -1853,11 +2293,20 @@
- 	/* 1. shortcuts */
- 	for (bp = shortcuts; bp < shortcuts + LEN(shortcuts); bp++) {
- 		if (ksym == bp->keysym && match(bp->mod, e->state)) {
-+			if (bp -> func != autocomplete)
-+				autocomplete ((const Arg []) { ACMPL_DEACTIVATE });
- 			bp->func(&(bp->arg));
- 			return;
- 		}
- 	}
- 
-+	if (!(
-+		len == 0 &&
-+		e -> state & ~ignoremod		// ACMPL_ISSUE: I'm not sure that this is the right way
-+				| ACMPL_MOD == ACMPL_MOD
-+	))
-+		autocomplete ((const Arg []) { ACMPL_DEACTIVATE });
-+
- 	/* 2. custom keys from config.h */
- 	if ((customkey = kmap(ksym, e->state))) {
- 		ttywrite(customkey, strlen(customkey), 1);
-@@ -1986,6 +2435,10 @@
+@@ -1986,6 +2088,10 @@
  		if (FD_ISSET(ttyfd, &rfd) || xev) {
  			if (!drawing) {
  				trigger = now;
@@ -2003,7 +1791,7 @@ diff -ruN st.orig/x.c st/x.c
  				drawing = 1;
  			}
  			timeout = (maxlatency - TIMEDIFF(now, trigger)) \
-@@ -1996,7 +2449,7 @@
+@@ -1996,7 +2102,7 @@
  
  		/* idle detected or maxlatency exhausted -> draw */
  		timeout = -1;
@@ -2012,7 +1800,7 @@ diff -ruN st.orig/x.c st/x.c
  			timeout = blinktimeout - TIMEDIFF(now, lastblink);
  			if (timeout <= 0) {
  				if (-timeout > blinktimeout) /* start visible */
-@@ -2032,12 +2485,15 @@
+@@ -2032,11 +2138,14 @@
  {
  	xw.l = xw.t = 0;
  	xw.isfixed = False;
@@ -2022,10 +1810,9 @@ diff -ruN st.orig/x.c st/x.c
  	ARGBEGIN {
  	case 'a':
  		allowaltscreen = 0;
- 		break;
++		break;
 +	case 'A':
 +		opt_alpha = EARGF(usage());
-+		break;
+ 		break;
  	case 'c':
  		opt_class = EARGF(usage());
- 		break;
