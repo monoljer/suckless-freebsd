@@ -1,6 +1,10 @@
-# Custom prepatched Suckless ST (0.8.5) for FreeBSD 13.2
+# Custom (prepatched) Suckless software for FreeBSD
 
-## Patches
+## Components
+
+### ST
+
+**Patches**
 
 * alpha
 * anysize
@@ -9,20 +13,46 @@
 * ligatures
 * scrollback
 
+**Dependencies**
 
-## Dependencies
+* HarfBuzz (Install from /usr/ports/print/harfbuzz)
+* Nerdfonts (Inconsolata LGC Nerd Font)
 
-### HarfBuzz
 
-Install from /usr/ports/print/harfbuzz
+### SLOCK
 
-### Nerdfonts (Inconsolata LGC Nerd Font)
+**Patches**
 
-## Instalation
+* dwmlogoandblurscreen
+* capscolor
+* user
+* dpms
 
-doas git clone https://git.suckless.org/st
-cd st
-doas patch < st-freebsd-0.1.diff
+**Dependencies**
+
+TBD
+
+### DWM
+
+**Patches**
+
+* attachaside
+* exitmenu
+* vanitygaps
+* alpha
+
+**Dependencies**
+
+TBD
+
+## General installation
+
+doas git clone https://git.suckless.org/**[tool]
+cd [tool]
+doas patch < [tool]-freebsd-0.1.diff
 doas make install
+
+
+
 
 
